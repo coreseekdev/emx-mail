@@ -478,6 +478,7 @@ func parsePOP3EntityBody(msg *Message, entity *gomessage.Entity) {
 					Filename:    filename,
 					ContentType: ct,
 					Size:        int64(len(body)),
+					Data:        body, // Store attachment data
 				})
 			}
 		}

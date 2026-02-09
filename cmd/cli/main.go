@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -204,11 +205,12 @@ func parseListFlags(args []string) listFlags {
 }
 
 type fetchFlags struct {
-	uid      string
-	folder   string
-	output   string
-	format   string
-	protocol string
+	uid             string
+	folder          string
+	output          string
+	format          string
+	protocol        string
+	saveAttachments string // Directory to save attachments
 }
 
 func parseFetchFlags(args []string) fetchFlags {
@@ -230,6 +232,9 @@ func parseFetchFlags(args []string) fetchFlags {
 		case "-protocol":
 			i++
 			f.protocol = args[i]
+		case "-save-attachments":
+			i++
+			f.saveAttachments = args[i]
 		default:
 			fatal("fetch: unknown flag '%s'", args[i])
 		}
@@ -487,6 +492,32 @@ func handleFetch(acc *config.AccountConfig, f fetchFlags) error {
 			for i, att := range msg.Attachments {
 				fmt.Fprintf(out, "  [%d] %s (%s, %d bytes)\n", i+1, att.Filename, att.ContentType, att.Size)
 			}
+
+			// Save attachments if requested
+			if f.saveAttachments != "" {
+				fmt.Fprintf(os.Stderr, "\nSaving attachments to: %s\n", f.saveAttachments)
+				for i, att := range msg.Attachments {
+					if att.Data == nil {
+						fmt.Fprintf(os.Stderr, "  [%d] Skipping %s (no data)\n", i+1, att.Filename)
+						continue
+					}
+
+					// Create target directory
+					if err := os.MkdirAll(f.saveAttachments, 0755); err != nil {
+						return fmt.Errorf("failed to create directory: %w", err)
+					}
+
+					// Build file path
+					filePath := filepath.Join(f.saveAttachments, att.Filename)
+
+					// Write file
+					if err := os.WriteFile(filePath, att.Data, 0644); err != nil {
+						return fmt.Errorf("failed to write %s: %w", att.Filename, err)
+					}
+
+					fmt.Fprintf(os.Stderr, "  [%d] Saved: %s\n", i+1, att.Filename)
+				}
+			}
 		}
 
 		fmt.Fprintf(out, "\n%s\n", msg.TextBody)
@@ -655,6 +686,7 @@ Fetch Options:
   -output <path>       Output file (default: stdout)
   -format <format>     Output format: text, html, or raw (default: text)
   -protocol <proto>    Force protocol: imap or pop3 (auto-detected)
+  -save-attachments <dir>  Save attachments to directory
 
 Delete Options:
   -uid <uid>           Message UID (IMAP) or ID (POP3) to delete

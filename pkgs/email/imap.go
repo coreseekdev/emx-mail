@@ -399,6 +399,7 @@ func parseIMAPMessageBody(msg *Message, raw []byte) {
 					Filename:    filename,
 					ContentType: ct,
 					Size:        int64(len(body)),
+					Data:        body, // Store attachment data
 				})
 			}
 		}

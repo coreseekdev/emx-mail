@@ -45,8 +45,7 @@ type Attachment struct {
 	ContentType string
 	Size        int64
 	ContentID   string
-	// Part contains the actual attachment data (can be large)
-	Part interface{}
+	Data        []byte // Actual attachment data
 }
 
 // MessageFlag represents message flags
