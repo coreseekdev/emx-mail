@@ -47,12 +47,12 @@ emx-mail/
 - 协议自动检测
 
 **命令**：
+- `init` - 初始化配置
 - `send` - 发送邮件
 - `list` - 列出邮件
 - `fetch` - 获取邮件内容和附件
 - `delete` - 删除邮件
-- `folders` - 列出文件夹
-- `init` - 初始化配置
+- `folders` - 列出所有文件夹（仅 IMAP）
 
 详细使用说明见 [docs/cli.md](docs/cli.md)
 
