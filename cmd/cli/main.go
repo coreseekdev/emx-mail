@@ -480,6 +480,15 @@ func handleFetch(acc *config.AccountConfig, f fetchFlags) error {
 		fmt.Fprintf(out, "Subject: %s\n", msg.Subject)
 		fmt.Fprintf(out, "Date: %s\n", msg.Date.Format(time.RFC1123))
 		fmt.Fprintf(out, "Message-ID: %s\n", msg.MessageID)
+
+		// Show attachments
+		if len(msg.Attachments) > 0 {
+			fmt.Fprintf(out, "\nAttachments (%d):\n", len(msg.Attachments))
+			for i, att := range msg.Attachments {
+				fmt.Fprintf(out, "  [%d] %s (%s, %d bytes)\n", i+1, att.Filename, att.ContentType, att.Size)
+			}
+		}
+
 		fmt.Fprintf(out, "\n%s\n", msg.TextBody)
 	default:
 		return fmt.Errorf("unsupported format: %s", f.format)
