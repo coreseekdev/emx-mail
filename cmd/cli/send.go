@@ -15,6 +15,7 @@ type sendFlags struct {
 	to, cc, subject, text, html, inReplyTo string
 	textFile, htmlFile                     string
 	attachments                            []string
+	dryRun                                 bool
 }
 
 func parseSendFlags(args []string) sendFlags {
@@ -29,6 +30,7 @@ func parseSendFlags(args []string) sendFlags {
 	fs.StringVar(&f.htmlFile, "html-file", "", "HTML body from file (\"-\" for stdin)")
 	fs.StringArrayVar(&f.attachments, "attachment", nil, "Attachment file path (repeatable)")
 	fs.StringVar(&f.inReplyTo, "in-reply-to", "", "Message-ID to reply to")
+	fs.BoolVar(&f.dryRun, "dry-run", false, "Preview email without sending")
 	if err := fs.Parse(args); err != nil {
 		fatal("send: %v", err)
 	}
@@ -103,6 +105,51 @@ func handleSend(acc *config.AccountConfig, f sendFlags) error {
 			Filename: filepath.Base(att),
 			Path:     att,
 		})
+	}
+
+	// Dry-run mode: preview without sending
+	if f.dryRun {
+		fmt.Println("=== Email Preview (Dry-Run Mode) ===")
+		fmt.Println()
+		fmt.Printf("From:    %s <%s>\n", acc.FromName, acc.Email)
+		fmt.Printf("To:      %s\n", formatAddressList(opts.To))
+		if len(opts.Cc) > 0 {
+			fmt.Printf("Cc:      %s\n", formatAddressList(opts.Cc))
+		}
+		fmt.Printf("Subject: %s\n", opts.Subject)
+		if opts.InReplyTo != "" {
+			fmt.Printf("In-Reply-To: %s\n", opts.InReplyTo)
+		}
+		fmt.Println()
+		if len(opts.Attachments) > 0 {
+			fmt.Println("Attachments:")
+			for _, att := range opts.Attachments {
+				fmt.Printf("  - %s\n", att.Filename)
+			}
+			fmt.Println()
+		}
+		if textBody != "" {
+			fmt.Println("Text Body:")
+			// Show preview (first 500 chars)
+			preview := textBody
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			fmt.Println(preview)
+			fmt.Println()
+		}
+		if htmlBody != "" {
+			fmt.Println("HTML Body: (attached)")
+			preview := htmlBody
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			fmt.Printf("Preview: %s\n", preview)
+			fmt.Println()
+		}
+		fmt.Println("=== End of Preview ===")
+		fmt.Println("Dry-run mode: email was NOT sent")
+		return nil
 	}
 
 	client := newSMTPClient(acc)
