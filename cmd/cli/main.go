@@ -116,9 +116,11 @@ Send Options:
   --to <emails>          Recipients (comma-separated)
   --cc <emails>          CC recipients (comma-separated)
   --subject <text>       Email subject
-  --text <text>          Plain text body
-  --html <html>          HTML body
-  --attachment <path>    Attachment file path
+  --text <text>          Plain text body (inline)
+  --html <html>          HTML body (inline)
+  --text-file <path>     Plain text body from file ("-" for stdin)
+  --html-file <path>     HTML body from file ("-" for stdin)
+  --attachment <path>    Attachment file path (repeatable)
   --in-reply-to <msgid>  Message-ID to reply to
 
 List Options:
@@ -126,6 +128,7 @@ List Options:
   --limit <number>       Maximum messages to show (default: 20)
   --unread-only          Show only unread messages
   --protocol <proto>     Force protocol: imap or pop3 (auto-detected)
+  --json                 Output in JSON lines format
 
 Fetch Options:
   --uid <uid>            Message UID (IMAP) or ID (POP3) to fetch
@@ -142,16 +145,20 @@ Delete Options:
   --protocol <proto>     Force protocol: imap or pop3 (auto-detected)
 
 Watch Options:
-  --folder <name>        Folder to watch (default: INBOX)
-  --handler <cmd>        Handler command for new emails (receives raw EML via stdin)
-  --poll-only            Force polling mode (disable IDLE)
-  --once                 Process existing emails then exit
+  --folder <name>         Folder to watch (default: INBOX)
+  --handler <cmd>         Handler command for new emails (receives raw EML via stdin)
+  --poll-only             Force polling mode (disable IDLE)
+  --once                  Process existing emails then exit
+  --idle-keep-alive <sec> IDLE keep-alive interval in seconds (default: 300, min: 60, max: 1740)
 
 Watch Handler:
   The handler receives the raw RFC 5322 email via stdin. Exit code 0 marks as processed.
   Use emx-save to save emails as .eml files:
   - Build: go build -o emx-save.exe ./cmd/emx-save
   - Use:   emx-mail watch --handler "emx-save ./emails"
+
+  IDLE mode sends NOOP every --idle-keep-alive seconds to keep the connection alive.
+  This prevents server timeouts for long-running watch sessions.
 
 Examples:
   emx-mail list

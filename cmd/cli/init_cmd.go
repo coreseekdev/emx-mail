@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/emx-mail/cli/pkgs/config"
 )
@@ -32,7 +33,9 @@ func handleInit() error {
 		return err
 	}
 	fmt.Printf("Created config file at: %s\n", configPath)
-	fmt.Printf("Set %s to point to this file.\n", config.EnvConfigJSONPath)
+	if os.Getenv(config.EnvConfigJSONPath) == "" {
+		fmt.Printf("Tip: set %s=%s to use this config file.\n", config.EnvConfigJSONPath, configPath)
+	}
 	fmt.Println("Please edit the file to add your email account credentials.")
 	return nil
 }

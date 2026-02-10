@@ -11,8 +11,8 @@ import (
 
 // Marker is the consumption position record for a channel.
 type Marker struct {
-	File      string    `json:"file"`      // Event file name (e.g., events.001-a1b2c3d4.jsonl.gz)
-	Offset    int64     `json:"offset"`    // Byte offset in uncompressed data (line end position)
+	File      string    `json:"file"`   // Event file name (e.g., events.001-a1b2c3d4.jsonl.gz)
+	Offset    int64     `json:"offset"` // Byte offset in uncompressed data (line end position)
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
@@ -86,5 +86,12 @@ func sanitizeChannel(channel string) string {
 		"|", "_",
 		" ", "_",
 	)
-	return replacer.Replace(channel)
+	safe := replacer.Replace(channel)
+	if safe == "." || safe == ".." {
+		safe = "_dot_"
+	}
+	if safe == "" {
+		safe = "_empty_"
+	}
+	return safe
 }

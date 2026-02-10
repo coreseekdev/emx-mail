@@ -20,6 +20,7 @@ import (
 // that return email.Message types.
 type POP3Client struct {
 	config POP3Config
+	conn   *pop3Conn // reusable session; nil when not connected
 }
 
 // POP3Config holds POP3 configuration
@@ -38,15 +39,57 @@ func NewPOP3Client(config POP3Config) *POP3Client {
 	return &POP3Client{config: config}
 }
 
-// FetchMessages connects, authenticates, and fetches message headers.
-func (c *POP3Client) FetchMessages(opts FetchOptions) (*ListResult, error) {
-	conn, err := c.connect()
+// Connect establishes and authenticates a POP3 session that will be
+// reused across subsequent method calls. Call Close() when done.
+func (c *POP3Client) Connect() error {
+	if c.conn != nil {
+		return nil // already connected
+	}
+	conn, err := c.dial()
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	return nil
+}
+
+// Close closes the POP3 connection (issues QUIT to commit any pending DELE).
+func (c *POP3Client) Close() error {
+	if c.conn != nil {
+		err := c.conn.quit()
+		c.conn = nil
+		return err
+	}
+	return nil
+}
+
+// ensureConnected returns a cleanup function. If the client already has a
+// persistent connection (via Connect), cleanup is a no-op. Otherwise a
+// temporary connection is created and cleanup will QUIT it.
+func (c *POP3Client) ensureConnected() (func(), error) {
+	if c.conn != nil {
+		return func() {}, nil
+	}
+	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.quit()
+	c.conn = conn
+	return func() {
+		c.conn.quit()
+		c.conn = nil
+	}, nil
+}
 
-	count, _, err := conn.stat()
+// FetchMessages connects, authenticates, and fetches message headers.
+func (c *POP3Client) FetchMessages(opts FetchOptions) (*ListResult, error) {
+	cleanup, err := c.ensureConnected()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	count, _, err := c.conn.stat()
 	if err != nil {
 		return nil, fmt.Errorf("POP3 STAT failed: %w", err)
 	}
@@ -73,10 +116,10 @@ func (c *POP3Client) FetchMessages(opts FetchOptions) (*ListResult, error) {
 
 	for id := start; id <= count; id++ {
 		// Use TOP to fetch headers + 0 body lines for listing
-		entity, err := conn.top(id, 0)
+		entity, err := c.conn.top(id, 0)
 		if err != nil {
 			// If TOP is not supported, fall back to RETR
-			entity, err = conn.retr(id)
+			entity, err = c.conn.retr(id)
 			if err != nil {
 				continue // skip messages that fail to parse
 			}
@@ -101,19 +144,19 @@ func (c *POP3Client) FetchMessages(opts FetchOptions) (*ListResult, error) {
 // FetchMessage fetches a single message by its sequence number (1-based).
 // POP3 does not have UIDs like IMAP; the "uid" here maps to the message number.
 func (c *POP3Client) FetchMessage(msgID uint32) (*Message, error) {
-	conn, err := c.connect()
+	cleanup, err := c.ensureConnected()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.quit()
+	defer cleanup()
 
-	entity, err := conn.retr(int(msgID))
+	entity, err := c.conn.retr(int(msgID))
 	if err != nil {
 		return nil, fmt.Errorf("POP3 RETR %d failed: %w", msgID, err)
 	}
 
 	msg := pop3EntityToMessage(entity, msgID)
-	parsePOP3EntityBody(msg, entity)
+	parseEntityBody(msg, entity)
 
 	return msg, nil
 }
@@ -121,18 +164,23 @@ func (c *POP3Client) FetchMessage(msgID uint32) (*Message, error) {
 // DeleteMessage deletes a message by its sequence number.
 // POP3 deletions are only finalized on a successful QUIT.
 func (c *POP3Client) DeleteMessage(msgID uint32) error {
-	conn, err := c.connect()
+	cleanup, err := c.ensureConnected()
 	if err != nil {
 		return err
 	}
 
-	if err := conn.dele(int(msgID)); err != nil {
-		conn.conn.Close() // don't QUIT to avoid committing partial state
+	if err := c.conn.dele(int(msgID)); err != nil {
+		// On error, discard the connection without QUIT to avoid committing
+		c.conn.conn.Close()
+		c.conn = nil
+		cleanup = func() {} // already cleaned up
 		return fmt.Errorf("POP3 DELE %d failed: %w", msgID, err)
 	}
 
-	// QUIT commits the deletion
-	return conn.quit()
+	// If using a temporary connection, QUIT commits the deletion.
+	// If using a persistent connection, deletion is committed on Close().
+	cleanup()
+	return nil
 }
 
 // FetchMessageByID implements MailReceiver.
@@ -144,9 +192,6 @@ func (c *POP3Client) FetchMessageByID(_ string, uid uint32) (*Message, error) {
 func (c *POP3Client) DeleteMessageByID(_ string, uid uint32, _ bool) error {
 	return c.DeleteMessage(uid)
 }
-
-// Close implements MailReceiver (POP3 connections are per-operation).
-func (c *POP3Client) Close() error { return nil }
 
 // tlsConfig returns the TLS configuration to use. If none is set in the
 // config, a sensible default with the server name is returned.
@@ -163,17 +208,17 @@ func (c *POP3Client) tlsConfig() *tls.Config {
 
 // ListMessageIDs returns all message (id, size) pairs.
 func (c *POP3Client) ListMessageIDs() ([]POP3MessageID, error) {
-	conn, err := c.connect()
+	cleanup, err := c.ensureConnected()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.quit()
+	defer cleanup()
 
-	return conn.list(0)
+	return c.conn.list(0)
 }
 
-// connect dials and authenticates to the POP3 server.
-func (c *POP3Client) connect() (*pop3Conn, error) {
+// dial establishes a new POP3 connection (TCP + TLS + AUTH).
+func (c *POP3Client) dial() (*pop3Conn, error) {
 	// Require encryption — refuse plaintext connections
 	if !c.config.SSL && !c.config.StartTLS {
 		return nil, fmt.Errorf("POP3 requires SSL or StartTLS; plaintext connections are not allowed")
@@ -333,11 +378,18 @@ func (c *pop3Conn) readAll() (*bytes.Buffer, error) {
 }
 
 // auth authenticates with USER/PASS.
+// PASS is sent directly via send()/readOne() instead of cmd() to avoid
+// the password being captured in the cmdLine variable (defence-in-depth
+// against accidental logging).
 func (c *pop3Conn) auth(user, password string) error {
 	if _, err := c.cmd("USER", false, user); err != nil {
 		return err
 	}
-	if _, err := c.cmd("PASS", false, password); err != nil {
+	// Send PASS directly to avoid password appearing in cmd()'s cmdLine string
+	if err := c.send("PASS " + password); err != nil {
+		return err
+	}
+	if _, err := c.readOne(); err != nil {
 		return err
 	}
 	// NOOP to confirm auth succeeded
@@ -353,10 +405,16 @@ func (c *pop3Conn) stat() (count, size int, err error) {
 	}
 	f := bytes.Fields(b.Bytes())
 	if len(f) < 2 {
-		return 0, 0, nil
+		return 0, 0, fmt.Errorf("POP3 STAT: unexpected response format")
 	}
-	count, _ = strconv.Atoi(string(f[0]))
-	size, _ = strconv.Atoi(string(f[1]))
+	count, err = strconv.Atoi(string(f[0]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("POP3 STAT: invalid count %q: %w", f[0], err)
+	}
+	size, err = strconv.Atoi(string(f[1]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("POP3 STAT: invalid size %q: %w", f[1], err)
+	}
 	return count, size, nil
 }
 
@@ -380,8 +438,14 @@ func (c *pop3Conn) list(msgID int) ([]POP3MessageID, error) {
 		if len(f) < 2 {
 			continue
 		}
-		id, _ := strconv.Atoi(string(f[0]))
-		sz, _ := strconv.Atoi(string(f[1]))
+		id, err := strconv.Atoi(string(f[0]))
+		if err != nil {
+			continue // skip unparseable lines
+		}
+		sz, err := strconv.Atoi(string(f[1]))
+		if err != nil {
+			continue
+		}
 		out = append(out, POP3MessageID{ID: id, Size: sz})
 	}
 	return out, nil
@@ -407,7 +471,10 @@ func (c *pop3Conn) uidl(msgID int) ([]POP3MessageID, error) {
 		if len(f) < 2 {
 			continue
 		}
-		id, _ := strconv.Atoi(string(f[0]))
+		id, err := strconv.Atoi(string(f[0]))
+		if err != nil {
+			continue
+		}
 		out = append(out, POP3MessageID{ID: id, UID: string(f[1])})
 	}
 	return out, nil
@@ -505,18 +572,6 @@ func pop3EntityToMessage(entity *gomessage.Entity, seqNum uint32) *Message {
 	}
 
 	return msg
-}
-
-// parsePOP3EntityBody reads the body of an entity into TextBody/HTMLBody.
-func parsePOP3EntityBody(msg *Message, entity *gomessage.Entity) {
-	parseEntityBody(msg, entity)
-}
-
-func parseNestedPOP3Multipart(msg *Message, entity *gomessage.Entity) {
-	// Handled by the recursive parseMultipart in body.go — kept for signature compat.
-	if nested := entity.MultipartReader(); nested != nil {
-		parseMultipart(msg, nested)
-	}
 }
 
 func pop3MailAddrsToEmail(addrs []*mail.Address) []Address {

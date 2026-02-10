@@ -421,7 +421,7 @@ func parseSeq(name string) int {
 	return n
 }
 
-// getFileStats calculates uncompressed size and line count by reading the file.
+// getFileStats calculates uncompressed size and line count by streaming the file.
 func (b *Bus) getFileStats(name string) (uncompressedSize int64, lineCount int64, firstLineHash string, err error) {
 	fpath := filepath.Join(b.Dir, name)
 	f, err := os.Open(fpath)
@@ -447,14 +447,14 @@ func (b *Bus) getFileStats(name string) (uncompressedSize int64, lineCount int64
 
 	gr.Multistream(true)
 
-	data, err := io.ReadAll(gr)
-	if err != nil {
-		return 0, 0, "", fmt.Errorf("failed to decompress: %w", err)
-	}
+	// Stream through the decompressed data without buffering it all in memory.
+	// Use a CountingReader to track uncompressed bytes.
+	cr := &countingReader{r: gr}
+	scanner := bufio.NewScanner(cr)
+	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	lc := int64(0)
 	firstLine := ""
-	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) > 0 {
@@ -466,10 +466,23 @@ func (b *Bus) getFileStats(name string) (uncompressedSize int64, lineCount int64
 		}
 	}
 
-	return int64(len(data)), lc, firstLine, scanner.Err()
+	return cr.n, lc, firstLine, scanner.Err()
+}
+
+// countingReader wraps an io.Reader and counts bytes read.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // readFile reads events from a gzip file, starting from the specified uncompressed byte offset.
+// It streams line by line without loading the entire file into memory.
 func (b *Bus) readFile(name string, fromOffset int64) ([]EventEntry, error) {
 	fpath := filepath.Join(b.Dir, name)
 	f, err := os.Open(fpath)
@@ -496,19 +509,17 @@ func (b *Bus) readFile(name string, fromOffset int64) ([]EventEntry, error) {
 	// gzip.Reader's Multistream(true) is the default behavior, reads all concatenated gzip members
 	gr.Multistream(true)
 
-	// Read all uncompressed content
-	data, err := io.ReadAll(gr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress: %w", err)
+	// Skip to fromOffset by discarding bytes
+	if fromOffset > 0 {
+		if _, err := io.CopyN(io.Discard, gr, fromOffset); err != nil {
+			if err == io.EOF {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("failed to seek to offset: %w", err)
+		}
 	}
 
-	if int64(len(data)) <= fromOffset {
-		return nil, nil
-	}
-
-	// Read line by line starting from offset
-	remaining := data[fromOffset:]
-	scanner := bufio.NewScanner(bytes.NewReader(remaining))
+	scanner := bufio.NewScanner(gr)
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // Max 10MB single line
 
 	var entries []EventEntry

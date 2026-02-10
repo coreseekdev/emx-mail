@@ -1,6 +1,7 @@
 package email
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,13 +16,14 @@ import (
 
 // WatchOptions holds options for watch mode
 type WatchOptions struct {
-	Folder       string
-	HandlerCmd   string
-	KeepAlive    int // seconds
-	PollInterval int // seconds
-	MaxRetries   int
-	PollOnly     bool
-	Once         bool
+	Folder        string
+	HandlerCmd    string
+	KeepAlive     int // seconds
+	PollInterval  int // seconds
+	MaxRetries    int
+	PollOnly      bool
+	Once          bool
+	IdleKeepAlive int // seconds, NOOP interval during IDLE
 }
 
 // WatchStatus represents a status message type
@@ -44,8 +46,10 @@ type EmailNotification struct {
 	Flags     []string `json:"flags"`
 }
 
-// Watch starts watching for new emails on the IMAP server
-func (c *IMAPClient) Watch(opts WatchOptions) error {
+// Watch starts watching for new emails on the IMAP server.
+// The provided context controls the lifetime of the watch loop; cancel it
+// (e.g. on SIGINT/SIGTERM) for a graceful shutdown.
+func (c *IMAPClient) Watch(ctx context.Context, opts WatchOptions) error {
 	// Set defaults
 	if opts.Folder == "" {
 		opts.Folder = "INBOX"
@@ -58,6 +62,16 @@ func (c *IMAPClient) Watch(opts WatchOptions) error {
 	}
 	if opts.MaxRetries <= 0 {
 		opts.MaxRetries = 5
+	}
+	if opts.IdleKeepAlive <= 0 {
+		opts.IdleKeepAlive = 300 // 5 minutes default
+	}
+	// Validate IDLE keep-alive range (min 1 minute, max 29 minutes per RFC 2177)
+	if opts.IdleKeepAlive < 60 {
+		opts.IdleKeepAlive = 60 // minimum 1 minute
+	}
+	if opts.IdleKeepAlive > 1740 {
+		opts.IdleKeepAlive = 1740 // maximum 29 minutes
 	}
 
 	// Connect
@@ -113,9 +127,9 @@ func (c *IMAPClient) Watch(opts WatchOptions) error {
 
 	// Enter watch loop
 	if supportsIDLE && !opts.PollOnly {
-		return c.watchIDLE(opts, statusWrite)
+		return c.watchIDLE(ctx, opts, statusWrite)
 	}
-	return c.watchPoll(opts, statusWrite)
+	return c.watchPoll(ctx, opts, statusWrite)
 }
 
 // checkIDLESupport checks if the server supports IDLE
@@ -482,14 +496,39 @@ func (c *IMAPClient) markAsProcessed(uid uint32, statusWrite func(WatchStatus)) 
 }
 
 // watchIDLE watches for new emails using IMAP IDLE
-func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus)) error {
+func (c *IMAPClient) watchIDLE(ctx context.Context, opts WatchOptions, statusWrite func(WatchStatus)) error {
 	statusWrite(WatchStatus{
 		Type:    "idle",
 		Level:   "info",
 		Message: "IDLE mode started",
 	})
 
+	// Use IdleKeepAlive as IDLE timeout to periodically refresh connection
+	// This sends NOOP at regular intervals to keep the connection alive
+	idleTimeout := time.Duration(opts.IdleKeepAlive) * time.Second
+	if idleTimeout > 29*time.Minute {
+		idleTimeout = 29 * time.Minute // RFC 2177 recommends max 29 minutes
+	}
+
+	statusWrite(WatchStatus{
+		Type:    "idle",
+		Level:   "info",
+		Message: fmt.Sprintf("IDLE keep-alive interval: %v", idleTimeout),
+	})
+
 	for {
+		// Check context before starting a new IDLE cycle
+		select {
+		case <-ctx.Done():
+			statusWrite(WatchStatus{
+				Type:    "connection",
+				Level:   "info",
+				Message: "Shutting down (context cancelled)",
+			})
+			return nil
+		default:
+		}
+
 		// Start IDLE
 		idleCmd, err := c.client.Idle()
 		if err != nil {
@@ -509,24 +548,37 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 			done <- struct{}{}
 		}()
 
+		timer := time.NewTimer(idleTimeout)
 		select {
-		case <-time.After(29 * time.Minute):
-			// IDLE timeout (29 min is recommended max)
+		case <-ctx.Done():
+			timer.Stop()
 			idleCmd.Close()
-			// Drain goroutine — Close() unblocks Wait().
 			<-done
+			statusWrite(WatchStatus{
+				Type:    "connection",
+				Level:   "info",
+				Message: "Shutting down (context cancelled)",
+			})
+			return nil
+
+		case <-timer.C:
+			// IDLE timeout - refresh connection with NOOP
+			idleCmd.Close()
+			<-done // Drain goroutine
 			statusWrite(WatchStatus{
 				Type:    "idle",
 				Level:   "info",
-				Message: "IDLE timeout, refreshing",
+				Message: "IDLE timeout, sending NOOP to keep connection alive",
 			})
 
 		case <-done:
+			// Server sent new email data
+			timer.Stop()
 			idleCmd.Close()
 			statusWrite(WatchStatus{
 				Type:    "idle",
 				Level:   "info",
-				Message: "IDLE response received",
+				Message: "IDLE response received, new emails detected",
 			})
 		}
 
@@ -539,7 +591,7 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 			})
 		}
 
-		// NOOP to keep connection alive
+		// Send NOOP to keep connection alive
 		if err := c.client.Noop().Wait(); err != nil {
 			statusWrite(WatchStatus{
 				Type:    "connection",
@@ -555,7 +607,7 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 }
 
 // watchPoll watches for new emails using polling
-func (c *IMAPClient) watchPoll(opts WatchOptions, statusWrite func(WatchStatus)) error {
+func (c *IMAPClient) watchPoll(ctx context.Context, opts WatchOptions, statusWrite func(WatchStatus)) error {
 	interval := time.Duration(opts.PollInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -568,6 +620,14 @@ func (c *IMAPClient) watchPoll(opts WatchOptions, statusWrite func(WatchStatus))
 
 	for {
 		select {
+		case <-ctx.Done():
+			statusWrite(WatchStatus{
+				Type:    "connection",
+				Level:   "info",
+				Message: "Shutting down (context cancelled)",
+			})
+			return nil
+
 		case <-ticker.C:
 			// Check for new emails
 			if err := c.processUnprocessed(opts, statusWrite); err != nil {

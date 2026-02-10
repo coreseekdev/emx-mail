@@ -216,26 +216,29 @@ func (c *SMTPClient) buildMessage(opts SendOptions) (*bytes.Buffer, error) {
 	// Add attachments
 	if mw != nil {
 		for _, att := range opts.Attachments {
-			var h mail.AttachmentHeader
-			h.SetFilename(att.Filename)
-			h.SetContentType("application/octet-stream", nil)
+			if err := func() error {
+				var h mail.AttachmentHeader
+				h.SetFilename(att.Filename)
+				h.SetContentType("application/octet-stream", nil)
 
-			w, err := mw.CreateAttachment(h)
-			if err != nil {
+				w, err := mw.CreateAttachment(h)
+				if err != nil {
+					return err
+				}
+
+				f, err := os.Open(att.Path)
+				if err != nil {
+					return fmt.Errorf("failed to open attachment %s: %w", att.Path, err)
+				}
+				defer f.Close()
+
+				if _, err := io.Copy(w, f); err != nil {
+					return fmt.Errorf("failed to copy attachment %s: %w", att.Path, err)
+				}
+				return w.Close()
+			}(); err != nil {
 				return nil, err
 			}
-
-			f, err := os.Open(att.Path)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open attachment %s: %w", att.Path, err)
-			}
-
-			if _, err := io.Copy(w, f); err != nil {
-				f.Close()
-				return nil, fmt.Errorf("failed to copy attachment %s: %w", att.Path, err)
-			}
-			f.Close()
-			w.Close()
 		}
 
 		if err := mw.Close(); err != nil {

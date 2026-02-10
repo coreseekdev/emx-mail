@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/emx-mail/cli/pkgs/patchwork"
@@ -168,8 +169,15 @@ func cmdDiff(args []string) error {
 		if len(parts) != 2 {
 			return fmt.Errorf("invalid range format, expected N..M (e.g., 1..2)")
 		}
-		fmt.Sscanf(parts[0], "%d", &rev1)
-		fmt.Sscanf(parts[1], "%d", &rev2)
+		var err error
+		rev1, err = strconv.Atoi(parts[0])
+		if err != nil {
+			return fmt.Errorf("invalid revision number %q: %w", parts[0], err)
+		}
+		rev2, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return fmt.Errorf("invalid revision number %q: %w", parts[1], err)
+		}
 	}
 
 	f, err := os.Open(*mboxFile)

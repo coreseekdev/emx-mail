@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/emx-mail/cli/pkgs/patchwork"
@@ -35,13 +33,8 @@ func cmdMbox(args []string) error {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return fmt.Errorf("read file: %w", err)
-	}
-
 	mb := patchwork.NewMailbox()
-	if err := mb.ReadMbox(bytes.NewReader(data)); err != nil {
+	if err := mb.ReadMbox(f); err != nil {
 		return fmt.Errorf("parse mbox: %w", err)
 	}
 

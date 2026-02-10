@@ -1,9 +1,10 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"fmt"
 	"io"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,76 +25,95 @@ func main() {
 
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0755); err != nil {
-	 fatal("failed to create directory: %v", err)
+		fatal("failed to create directory: %v", err)
 	}
 
-	// Read email from stdin
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		fatal("failed to read stdin: %v", err)
+	// Stream the email from stdin:
+	//  1. Buffer the header portion (up to the first blank line) to extract
+	//     the Message-ID using net/mail which handles RFC 5322 header folding.
+	//  2. Write the headers + body to a temp file via streaming (no full
+	//     in-memory buffer), then rename to the final path.
+	//
+	// This matches the streaming contract of the watch handler pipeline:
+	// watch → OS pipe → emx-save, with bounded memory usage.
+
+	reader := bufio.NewReaderSize(os.Stdin, 64*1024) // 64KB read buffer
+
+	// Read header portion by scanning until blank line (\r\n\r\n or \n\n).
+	var headerBuf []byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		headerBuf = append(headerBuf, line...)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fatal("failed to read stdin: %v", err)
+		}
+		// Blank line (just \n or \r\n) marks end of headers
+		trimmed := strings.TrimRight(string(line), "\r\n")
+		if trimmed == "" {
+			break
+		}
 	}
 
-	if len(data) == 0 {
+	if len(headerBuf) == 0 {
 		fatal("no email data received")
 	}
 
-	// Extract Message-ID from headers
-	messageID := extractMessageID(data)
+	// Parse headers using net/mail (handles RFC 5322 folded headers correctly)
+	msg, err := mail.ReadMessage(strings.NewReader(string(headerBuf)))
+	messageID := ""
+	if err == nil {
+		messageID = msg.Header.Get("Message-ID")
+		messageID = strings.Trim(strings.TrimSpace(messageID), "<>")
+	}
 	if messageID == "" {
 		fatal("no Message-ID header found in email")
 	}
 
-	// Sanitize Message-ID for use as filename
+	// Build output path
 	filename := sanitizeFilename(messageID) + ".eml"
 	path := filepath.Join(dir, filename)
 
-	// Check if file already exists
+	// Check if file already exists — append timestamp to avoid overwrite
 	if _, err := os.Stat(path); err == nil {
-		// File exists, append timestamp to avoid overwrite
 		timestamp := strings.ReplaceAll(time.Now().Format("20060102-150405"), ":", "")
 		filename = sanitizeFilename(messageID) + "-" + timestamp + ".eml"
 		path = filepath.Join(dir, filename)
 	}
 
-	// Write email to file
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		fatal("failed to write file: %v", err)
+	// Write to a temp file in the same directory then rename for atomicity
+	tmpFile, err := os.CreateTemp(dir, ".emx-save-*.tmp")
+	if err != nil {
+		fatal("failed to create temp file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // clean up on error
+
+	// Write the already-buffered header portion
+	if _, err := tmpFile.Write(headerBuf); err != nil {
+		tmpFile.Close()
+		fatal("failed to write headers: %v", err)
+	}
+
+	// Stream the remaining body from stdin → file (no full memory buffer)
+	if _, err := io.Copy(tmpFile, reader); err != nil {
+		tmpFile.Close()
+		fatal("failed to write body: %v", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		fatal("failed to close temp file: %v", err)
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, path); err != nil {
+		fatal("failed to rename temp file: %v", err)
 	}
 
 	// Write status to stderr (as per watch mode protocol)
 	fmt.Fprintf(os.Stderr, `{"type":"saved","message_id":%q,"path":%q}`+"\n", messageID, path)
-}
-
-// extractMessageID extracts the Message-ID header from email data
-func extractMessageID(data []byte) string {
-	// Message-ID is in the headers section (before the first blank line)
-	headerEnd := bytes.Index(data, []byte("\n\n"))
-	if headerEnd == -1 {
-		headerEnd = bytes.Index(data, []byte("\r\n\r\n"))
-	}
-	if headerEnd == -1 {
-		return ""
-	}
-
-	headers := data[:headerEnd]
-
-	// Look for Message-ID header (case-insensitive)
-	lines := bytes.Split(headers, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimLeft(line, "\r")
-		if bytes.HasPrefix(bytes.ToLower(line), []byte("message-id:")) {
-			// Extract the value after the colon
-			parts := bytes.SplitN(line, []byte(":"), 2)
-			if len(parts) == 2 {
-				// Remove leading/trailing whitespace and angle brackets
-				value := strings.TrimSpace(string(parts[1]))
-				value = strings.Trim(value, "<>")
-				return value
-			}
-		}
-	}
-
-	return ""
 }
 
 // sanitizeFilename sanitizes a string for safe use as a filename
@@ -120,6 +140,10 @@ Usage:
 Description:
   Reads a raw RFC 5322 email from stdin and saves it as an .eml file
   in the specified directory, using the Message-ID header as the filename.
+
+  The email is streamed from stdin with bounded memory usage — only the
+  headers are buffered in memory for Message-ID extraction; the body is
+  written directly to disk.
 
   The filename is sanitized for filesystem safety.
 

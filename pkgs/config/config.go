@@ -58,11 +58,12 @@ func (a *AccountConfig) Domain() string {
 
 // WatchConfig holds watch mode configuration
 type WatchConfig struct {
-	Folder       string `json:"folder,omitempty"`        // Folder to watch, default "INBOX"
-	HandlerCmd   string `json:"handler_cmd,omitempty"`   // Handler command (e.g., "/path/to/handler --opt")
-	KeepAlive    int    `json:"keep_alive,omitempty"`    // Keep-alive interval in seconds, default 30
-	PollInterval int    `json:"poll_interval,omitempty"` // Poll interval in seconds, default 30
-	MaxRetries   int    `json:"max_retries,omitempty"`   // Max retry attempts, default 5
+	Folder        string `json:"folder,omitempty"`          // Folder to watch, default "INBOX"
+	HandlerCmd    string `json:"handler_cmd,omitempty"`     // Handler command (e.g., "/path/to/handler --opt")
+	KeepAlive     int    `json:"keep_alive,omitempty"`      // Keep-alive interval in seconds, default 30 (polling mode only)
+	PollInterval  int    `json:"poll_interval,omitempty"`   // Poll interval in seconds, default 30
+	MaxRetries    int    `json:"max_retries,omitempty"`     // Max retry attempts, default 5
+	IdleKeepAlive int    `json:"idle_keep_alive,omitempty"` // IDLE keep-alive interval in seconds, default 300 (5 min)
 }
 
 // Config holds the application configuration
@@ -125,12 +126,23 @@ func SaveConfig(path string, root *RootConfig) error {
 }
 
 // GetEnvConfigPath returns the config file path from EnvConfigJSONPath.
+// If the environment variable is not set, falls back to the default path
+// ~/.emx-mail/config.json.
 func GetEnvConfigPath() (string, error) {
 	path := strings.TrimSpace(os.Getenv(EnvConfigJSONPath))
-	if path == "" {
-		return "", fmt.Errorf("%s is not set", EnvConfigJSONPath)
+	if path != "" {
+		return path, nil
 	}
-	return path, nil
+	return DefaultConfigPath()
+}
+
+// DefaultConfigPath returns the default config file path (~/.emx-mail/config.json).
+func DefaultConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".emx-mail", "config.json"), nil
 }
 
 // GetAccount returns an account by name or email.
