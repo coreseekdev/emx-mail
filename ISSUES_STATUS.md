@@ -1,7 +1,7 @@
 # REVIEW.md 问题状态报告
 
 生成时间: 2026-02-11
-更新时间: 2026-02-11 (第二轮修复)
+更新时间: 2026-02-11 (第三轮修复完成)
 
 本报告基于 REVIEW.md 中的所有审查问题，检查当前代码状态。
 
@@ -39,7 +39,7 @@
 | S7 | 中 | Event Bus 锁文件竞态条件 | ⚠️ **已改进** - 建议进一步检查 PID 检测实现 |
 | S8 | 中 | emx-config 命令注入风险 | ⚠️ **低风险** - 命令参数硬编码，建议允许配置完整路径 |
 | S9 | 低 | watchIDLE goroutine 泄漏 | ✅ **已修复** - 使用 `time.NewTimer` + `timer.Stop()` |
-| S10 | 低 | emx-save 文件名可能信息泄露 | ⚠️ **仍存在** - Message-ID 作为文件名可能泄露信息 |
+| S10 | 低 | emx-save 文件名可能信息泄露 | ✅ **已修复** - 使用 hash 文件名 (commit 7a9daa1) |
 
 ---
 
@@ -78,7 +78,7 @@
 | R9 | 高 | convertFlags 双反斜杠 Bug | ✅ **已修复** - 直接使用 `string(f)` |
 | R10 | 中 | reconnect 不接受 Context | ✅ **已修复** - 签名改为 `reconnect(ctx context.Context, ...)` |
 | R11 | 低 | go.mod pflag 标记为 indirect | ✅ **已修复** - 运行 `go mod tidy` 修正 |
-| R12 | 低 | pop3Conn.cmd() 使用 interface{} | ❌ **仍存在** - args 使用 `interface{}` + `%v` 格式化 |
+| R12 | 低 | pop3Conn.cmd() 使用 interface{} | ✅ **已修复** - 使用类型断言优化 (commit 7a9daa1) |
 | R13 | 低 | Attachment 与 AttachmentPath 命名混淆 | ⚠️ **仍存在** - 命名相似但用途不同 |
 
 ---
@@ -118,16 +118,16 @@
 
 ## 统计摘要
 
-### 按状态分类 (更新 2026-02-11 第二轮)
-- ✅ **已修复**: 46 项 (+8)
-- ⚠️ **部分修复**: 6 项 (-5)
-- ❌ **仍存在**: 10 项 (-5)
+### 按状态分类 (更新 2026-02-11 第三轮)
+- ✅ **已修复**: 49 项 (+3)
+- ⚠️ **部分修复**: 5 项 (-1)
+- ❌ **仍存在**: 8 项 (-2)
 - ❓ **需进一步检查**: 4 项
 
 ### 按优先级分类 (仍存在的问题)
-- **严重/高优先级**: 1 项 (R2 - 需进一步检查)
-- **中优先级**: 5 项
-- **低优先级**: 8 项
+- **严重/高优先级**: 0 项
+- **中优先级**: 3 项 (5, R7, S22)
+- **低优先级**: 5 项 (12, R5, R13, S3, S8)
 
 ### 最近修复
 
@@ -152,21 +152,35 @@
 **commit 616e485** (第二轮):
 - U10: send --dry-run 预览功能
 
+**commit 7a9daa1** (第三轮):
+- R12: POP3 cmd() 类型断言优化
+- S10: emx-save hash 文件名防止信息泄露
+- R2: 验证 cmdMbox 已移除 (非问题)
+
 ---
 
 ## 已完成的重大改进
 
-1. **TLS 安全强化**: 所有 IMAP/SMTP 连接现在正确设置 ServerName
+1. **TLS 安全强化**: 所有 IMAP/SMTP/POP3 连接现在正确设置 ServerName
 2. **性能优化**: list --unread-only 使用服务端过滤，避免下载全部邮件
 3. **用户体验**: send --dry-run 允许预览邮件内容
-4. **依赖升级**: go-imap/v2 升级到最新版本
+4. **依赖升级**: go-imap/v2 升级到最新版本 (v2.0.0-beta.8)
 5. **输入验证**: 邮件地址格式验证，避免无效地址导致的错误
+6. **隐私保护**: emx-save 使用 hash 文件名，防止 Message-ID 信息泄露
+7. **代码质量**: POP3 cmd() 使用类型断言替代 interface{}，提高性能
 
 ---
 
 ## 剩余建议优先处理的问题
 
-1. **R2**: cmdMbox io.ReadAll 问题 - 需进一步检查文件是否存在
-2. **S22**: Event Bus TOCTOU 竞态 - 需要使用 flock/LockFileEx (平台相关)
-3. **R12**: POP3 cmd() interface{} - 低优先级风格改进
-4. **R13**: Attachment 命名混淆 - 低优先级重构
+### 中优先级
+1. **S22**: Event Bus TOCTOU 竞态 - 需要使用 flock/LockFileEx (平台相关)
+2. **5**: POP3Config StartTLS 支持 - 配置中有但结构体缺少字段
+3. **R7**: POP3 连接复用验证 - 需确认 Connect/Close 是否正确复用连接
+
+### 低优先级
+4. **R13**: Attachment 与 AttachmentPath 命名混淆 - 低优先级重构
+5. **12**: Event Bus 锁机制检查 - 建议检查当前实现
+6. **R5**: IMAP ensureConnected 语义验证 - 建议验证当前实现
+7. **S3**: watch 模式命令注入风险 - 已使用 sh -c，仍有邮件内容风险
+8. **S8**: emx-config 命令注入风险 - 低风险，命令参数硬编码
