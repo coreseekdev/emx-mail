@@ -60,6 +60,18 @@ type AccountConfig struct {
 		SSL      bool `json:"ssl"`
 		StartTLS bool `json:"starttls"`
 	} `json:"smtp"`
+
+	// Watch settings
+	Watch *WatchConfig `json:"watch,omitempty"`
+}
+
+// WatchConfig holds watch mode configuration
+type WatchConfig struct {
+	Folder       string `json:"folder,omitempty"`        // Folder to watch, default "INBOX"
+	HandlerCmd   string `json:"handler_cmd,omitempty"`   // Handler command (e.g., "/path/to/handler --opt")
+	KeepAlive    int    `json:"keep_alive,omitempty"`    // Keep-alive interval in seconds, default 30
+	PollInterval int    `json:"poll_interval,omitempty"` // Poll interval in seconds, default 30
+	MaxRetries   int    `json:"max_retries,omitempty"`   // Max retry attempts, default 5
 }
 
 // Config holds the application configuration

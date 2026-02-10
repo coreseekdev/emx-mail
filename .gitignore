@@ -38,11 +38,16 @@ vendor/
 config.json
 *.json.bak
 
+# Email storage (watch mode output)
+emails/
+*.eml
+
 # Temporary files
 *.tmp
 *.temp
 tmp/
 temp/
+debug-*.go
 
 # Log files
 *.log

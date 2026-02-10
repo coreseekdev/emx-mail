@@ -1,0 +1,591 @@
+package email
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/emersion/go-imap/v2"
+)
+
+// WatchOptions holds options for watch mode
+type WatchOptions struct {
+	Folder       string
+	HandlerCmd   string
+	KeepAlive    int // seconds
+	PollInterval int // seconds
+	MaxRetries   int
+	PollOnly     bool
+	Once         bool
+}
+
+// WatchStatus represents a status message type
+type WatchStatus struct {
+	Type    string `json:"type"`           // "connection", "idle", "process", "mark", "error"
+	Level   string `json:"level,omitempty"` // "info", "warn", "error"
+	Message string `json:"message"`
+	UID     uint32 `json:"uid,omitempty"`
+}
+
+// EmailNotification represents a new email notification
+type EmailNotification struct {
+	Type      string   `json:"type"` // "email"
+	UID       uint32   `json:"uid"`
+	MessageID string   `json:"message_id"`
+	From      string   `json:"from"`
+	To        []string `json:"to"`
+	Subject   string   `json:"subject"`
+	Date      string   `json:"date"`
+	Flags     []string `json:"flags"`
+}
+
+// Watch starts watching for new emails on the IMAP server
+func (c *IMAPClient) Watch(opts WatchOptions) error {
+	// Set defaults
+	if opts.Folder == "" {
+		opts.Folder = "INBOX"
+	}
+	if opts.KeepAlive <= 0 {
+		opts.KeepAlive = 30
+	}
+	if opts.PollInterval <= 0 {
+		opts.PollInterval = 30
+	}
+	if opts.MaxRetries <= 0 {
+		opts.MaxRetries = 5
+	}
+
+	// Connect
+	if err := c.Connect(); err != nil {
+		return err
+	}
+	defer c.Close()
+
+	statusWrite := func(s WatchStatus) {
+		data, _ := json.Marshal(s)
+		fmt.Fprintln(os.Stderr, string(data))
+	}
+
+	statusWrite(WatchStatus{
+		Type:    "connection",
+		Level:   "info",
+		Message: fmt.Sprintf("Connected to %s", c.config.Host),
+	})
+
+	// Select folder
+	if _, err := c.client.Select(opts.Folder, nil).Wait(); err != nil {
+		return fmt.Errorf("failed to select folder %s: %w", opts.Folder, err)
+	}
+
+	// Check for IDLE support
+	supportsIDLE := c.checkIDLESupport()
+	if !supportsIDLE && !opts.PollOnly {
+		statusWrite(WatchStatus{
+			Type:    "idle",
+			Level:   "warn",
+			Message: fmt.Sprintf("Server doesn't support IDLE, falling back to polling (%ds interval)", opts.PollInterval),
+		})
+	}
+
+	// Process existing unprocessed emails
+	if err := c.processUnprocessed(opts, statusWrite); err != nil {
+		statusWrite(WatchStatus{
+			Type:    "error",
+			Level:   "error",
+			Message: fmt.Sprintf("Failed to process existing emails: %v", err),
+		})
+		// Continue anyway
+	}
+
+	if opts.Once {
+		statusWrite(WatchStatus{
+			Type:    "connection",
+			Level:   "info",
+			Message: "One-time processing complete, exiting",
+		})
+		return nil
+	}
+
+	// Enter watch loop
+	if supportsIDLE && !opts.PollOnly {
+		return c.watchIDLE(opts, statusWrite)
+	}
+	return c.watchPoll(opts, statusWrite)
+}
+
+// checkIDLESupport checks if the server supports IDLE
+func (c *IMAPClient) checkIDLESupport() bool {
+	caps, err := c.client.Capability().Wait()
+	if err != nil {
+		return false
+	}
+	return caps.Has("IDLE")
+}
+
+// processUnprocessed processes emails that are not yet Seen
+func (c *IMAPClient) processUnprocessed(opts WatchOptions, statusWrite func(WatchStatus)) error {
+	// Search for all emails (we'll filter by Seen flag manually)
+	// Use UIDSearch to get UIDs instead of sequence numbers
+	searchData, err := c.client.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
+
+	if err != nil {
+		return fmt.Errorf("search failed: %w", err)
+	}
+
+	uids := searchData.AllUIDs()
+	if len(uids) == 0 {
+		statusWrite(WatchStatus{
+			Type:    "process",
+			Level:   "info",
+			Message: "No unprocessed emails found",
+		})
+		return nil
+	}
+
+	statusWrite(WatchStatus{
+		Type:    "process",
+		Level:   "info",
+		Message: fmt.Sprintf("Found %d total emails", len(uids)),
+	})
+
+	// Filter out emails that are already Seen (already processed)
+	unprocessedUIDs := make([]uint32, 0, len(uids))
+	for _, uid := range uids {
+		isSeen, err := c.emailIsSeen(uint32(uid))
+		if err != nil {
+			continue // Skip if we can't check
+		}
+		if !isSeen {
+			unprocessedUIDs = append(unprocessedUIDs, uint32(uid))
+		}
+	}
+
+	if len(unprocessedUIDs) == 0 {
+		statusWrite(WatchStatus{
+			Type:    "process",
+			Level:   "info",
+			Message: "No unprocessed emails found",
+		})
+		return nil
+	}
+
+	statusWrite(WatchStatus{
+		Type:    "process",
+		Level:   "info",
+		Message: fmt.Sprintf("Processing %d unprocessed emails", len(unprocessedUIDs)),
+	})
+
+	// Process each email
+	for _, uid := range unprocessedUIDs {
+		if err := c.processEmail(uid, opts, statusWrite); err != nil {
+			statusWrite(WatchStatus{
+				Type:    "error",
+				Level:   "error",
+				Message: fmt.Sprintf("Failed to process UID %d: %v", uid, err),
+				UID:     uid,
+			})
+			// Continue with next email (sequential processing)
+			continue
+		}
+	}
+
+	return nil
+}
+
+// emailIsSeen checks if an email has the \Seen flag
+func (c *IMAPClient) emailIsSeen(uid uint32) (bool, error) {
+	uidSet := imap.UIDSetNum(imap.UID(uid))
+	msgs, err := c.client.Fetch(uidSet, &imap.FetchOptions{
+		Flags: true,
+	}).Collect()
+
+	if err != nil {
+		return false, err
+	}
+
+	if len(msgs) == 0 {
+		return false, fmt.Errorf("no messages returned for UID %d", uid)
+	}
+
+	msg := msgs[0]
+	// Check if Seen
+	for _, f := range msg.Flags {
+		if f == imap.FlagSeen {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// processEmail processes a single email
+func (c *IMAPClient) processEmail(uid uint32, opts WatchOptions, statusWrite func(WatchStatus)) error {
+	// Fetch email metadata
+	metadata, err := c.fetchEmailMetadata(uid)
+	if err != nil {
+		return fmt.Errorf("failed to fetch metadata: %w", err)
+	}
+
+	// Fetch full email (RFC 5322 format)
+	rawEmail, err := c.fetchRawEmail(uid)
+	if err != nil {
+		return fmt.Errorf("failed to fetch email: %w", err)
+	}
+
+	// Notify stdout about new email
+	notification := EmailNotification{
+		Type:      "email",
+		UID:       uid,
+		MessageID: metadata.MessageID,
+		From:      metadata.From,
+		To:        metadata.To,
+		Subject:   metadata.Subject,
+		Date:      metadata.Date,
+		Flags:     metadata.Flags,
+	}
+	notifData, _ := json.Marshal(notification)
+	fmt.Fprintln(os.Stdout, string(notifData))
+
+	// If no handler, just mark as processed
+	if opts.HandlerCmd == "" {
+		statusWrite(WatchStatus{
+			Type:    "process",
+			Level:   "info",
+			Message: fmt.Sprintf("No handler configured, marking UID %d as processed", uid),
+			UID:     uid,
+		})
+		return c.markAsProcessed(uid, statusWrite)
+	}
+
+	// Run handler
+	statusWrite(WatchStatus{
+		Type:    "process",
+		Level:   "info",
+		Message: fmt.Sprintf("Processing UID %d with handler: %s", uid, opts.HandlerCmd),
+		UID:     uid,
+	})
+
+	exitCode, err := c.runHandler(opts.HandlerCmd, rawEmail)
+	if err != nil {
+		return fmt.Errorf("handler execution failed: %w", err)
+	}
+
+	if exitCode != 0 {
+		return fmt.Errorf("handler failed with exit code %d", exitCode)
+	}
+
+	// Handler succeeded, mark as processed
+	statusWrite(WatchStatus{
+		Type:    "process",
+		Level:   "info",
+		Message: fmt.Sprintf("Handler succeeded for UID %d, marking as processed", uid),
+		UID:     uid,
+	})
+
+	return c.markAsProcessed(uid, statusWrite)
+}
+
+// EmailMetadata holds email metadata
+type EmailMetadata struct {
+	MessageID string
+	From      string
+	To        []string
+	Subject   string
+	Date      string
+	Flags     []string
+}
+
+// fetchEmailMetadata fetches email metadata
+func (c *IMAPClient) fetchEmailMetadata(uid uint32) (*EmailMetadata, error) {
+	uidSet := imap.UIDSetNum(imap.UID(uid))
+	msgs, err := c.client.Fetch(uidSet, &imap.FetchOptions{
+		Envelope: true,
+		Flags:    true,
+	}).Collect()
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("no messages returned for UID %d", uid)
+	}
+
+	msg := msgs[0]
+
+	metadata := &EmailMetadata{
+		Flags: convertFlags(msg.Flags),
+	}
+
+	if env := msg.Envelope; env != nil {
+		metadata.MessageID = env.MessageID
+		metadata.Subject = env.Subject
+		metadata.Date = env.Date.Format(time.RFC1123)
+		if len(env.From) > 0 {
+			metadata.From = env.From[0].Addr()
+		}
+		to := make([]string, 0, len(env.To))
+		for _, addr := range env.To {
+			to = append(to, addr.Addr())
+		}
+		metadata.To = to
+	}
+
+	return metadata, nil
+}
+
+// convertFlags converts imap.Flags to string slice
+func convertFlags(flags []imap.Flag) []string {
+	result := make([]string, 0, len(flags))
+	for _, f := range flags {
+		result = append(result, fmt.Sprintf("\\%s", f))
+	}
+	return result
+}
+
+// fetchRawEmail fetches the raw RFC 5322 email
+func (c *IMAPClient) fetchRawEmail(uid uint32) ([]byte, error) {
+	uidSet := imap.UIDSetNum(imap.UID(uid))
+	bodySection := &imap.FetchItemBodySection{Peek: true}
+	msgs, err := c.client.Fetch(uidSet, &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{bodySection},
+	}).Collect()
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("no messages returned for UID %d", uid)
+	}
+
+	msg := msgs[0]
+	rawBody := msg.FindBodySection(bodySection)
+	if rawBody == nil {
+		return nil, fmt.Errorf("no body section returned")
+	}
+
+	data, err := io.ReadAll(bytes.NewReader(rawBody))
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// runHandler executes the handler program with the email as stdin
+func (c *IMAPClient) runHandler(cmd string, emailData []byte) (int, error) {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("empty handler command")
+	}
+
+	cmdExec := parts[0]
+	args := parts[1:]
+
+	cmdObj := exec.Command(cmdExec, args...)
+	cmdObj.Stdin = strings.NewReader(string(emailData))
+	cmdObj.Stdout = os.Stderr // Handler stdout goes to stderr
+	cmdObj.Stderr = os.Stderr
+
+	err := cmdObj.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode(), nil
+		}
+		return 1, err
+	}
+
+	return 0, nil
+}
+
+// markAsProcessed marks an email as Seen
+func (c *IMAPClient) markAsProcessed(uid uint32, statusWrite func(WatchStatus)) error {
+	uidSet := imap.UIDSetNum(imap.UID(uid))
+
+	// Store flags: add Seen flag
+	_, err := c.client.Store(uidSet, &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagSeen},
+	}, nil).Collect()
+
+	if err != nil {
+		return fmt.Errorf("failed to mark UID %d: %w", uid, err)
+	}
+
+	statusWrite(WatchStatus{
+		Type:    "mark",
+		Level:   "info",
+		Message: fmt.Sprintf("Marked UID %d as \\Seen", uid),
+		UID:     uid,
+	})
+
+	return nil
+}
+
+// watchIDLE watches for new emails using IMAP IDLE
+func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus)) error {
+	statusWrite(WatchStatus{
+		Type:    "idle",
+		Level:   "info",
+		Message: "IDLE mode started",
+	})
+
+	ticker := time.NewTicker(time.Duration(opts.KeepAlive) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		// Start IDLE
+		idleCmd, err := c.client.Idle()
+		if err != nil {
+			return fmt.Errorf("IDLE start failed: %w", err)
+		}
+		if err := idleCmd.Wait(); err != nil {
+			return fmt.Errorf("IDLE wait failed: %w", err)
+		}
+
+		// Wait for updates or timeout
+		done := make(chan struct{}, 1)
+		go func() {
+			idleCmd.Wait()
+			done <- struct{}{}
+		}()
+
+		select {
+		case <-time.After(29 * time.Minute):
+			// IDLE timeout (29 min is recommended max)
+			idleCmd.Close()
+			statusWrite(WatchStatus{
+				Type:    "idle",
+				Level:   "info",
+				Message: "IDLE timeout, refreshing",
+			})
+
+		case <-done:
+			idleCmd.Close()
+			statusWrite(WatchStatus{
+				Type:    "idle",
+				Level:   "info",
+				Message: "IDLE response received",
+			})
+
+			// Check for new emails
+			if err := c.processUnprocessed(opts, statusWrite); err != nil {
+				statusWrite(WatchStatus{
+					Type:    "error",
+					Level:   "error",
+					Message: fmt.Sprintf("Failed to process new emails: %v", err),
+				})
+			}
+		}
+
+		// Keep-alive NOOP
+		select {
+		case <-ticker.C:
+			if err := c.client.Noop().Wait(); err != nil {
+				statusWrite(WatchStatus{
+					Type:    "connection",
+					Level:   "error",
+					Message: fmt.Sprintf("NOOP failed: %v", err),
+				})
+				// Try to reconnect
+				if err := c.reconnect(opts, statusWrite); err != nil {
+					return err
+				}
+			}
+		default:
+			// Don't block if ticker hasn't fired
+		}
+	}
+}
+
+// watchPoll watches for new emails using polling
+func (c *IMAPClient) watchPoll(opts WatchOptions, statusWrite func(WatchStatus)) error {
+	interval := time.Duration(opts.PollInterval) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	statusWrite(WatchStatus{
+		Type:    "idle",
+		Level:   "info",
+		Message: fmt.Sprintf("Polling mode started (interval: %ds)", opts.PollInterval),
+	})
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check for new emails
+			if err := c.processUnprocessed(opts, statusWrite); err != nil {
+				statusWrite(WatchStatus{
+					Type:    "error",
+					Level:   "error",
+					Message: fmt.Sprintf("Failed to check for new emails: %v", err),
+				})
+			}
+
+			// NOOP to keep connection alive
+			if err := c.client.Noop().Wait(); err != nil {
+				statusWrite(WatchStatus{
+					Type:    "connection",
+					Level:   "error",
+					Message: fmt.Sprintf("NOOP failed: %v", err),
+				})
+				// Try to reconnect
+				if err := c.reconnect(opts, statusWrite); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+// reconnect attempts to reconnect with exponential backoff
+func (c *IMAPClient) reconnect(opts WatchOptions, statusWrite func(WatchStatus)) error {
+	for attempt := 0; attempt < opts.MaxRetries; attempt++ {
+		waitTime := time.Duration(1<<uint(attempt)) * time.Second
+		if waitTime > 30*time.Second {
+			waitTime = 30 * time.Second
+		}
+
+		statusWrite(WatchStatus{
+			Type:    "connection",
+			Level:   "warn",
+			Message: fmt.Sprintf("Connection lost, reconnecting in %v (attempt %d/%d)", waitTime, attempt+1, opts.MaxRetries),
+		})
+
+		time.Sleep(waitTime)
+
+		c.Close()
+		if err := c.Connect(); err != nil {
+			statusWrite(WatchStatus{
+				Type:    "connection",
+				Level:   "error",
+				Message: fmt.Sprintf("Reconnect failed: %v", err),
+			})
+			continue
+		}
+
+		if _, err := c.client.Select(opts.Folder, nil).Wait(); err != nil {
+			c.Close()
+			statusWrite(WatchStatus{
+				Type:    "connection",
+				Level:   "error",
+				Message: fmt.Sprintf("Failed to select folder after reconnect: %v", err),
+			})
+			continue
+		}
+
+		statusWrite(WatchStatus{
+			Type:    "connection",
+			Level:   "info",
+			Message: "Reconnected successfully",
+		})
+		return nil
+	}
+
+	return fmt.Errorf("failed to reconnect after %d attempts", opts.MaxRetries)
+}

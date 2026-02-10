@@ -94,6 +94,11 @@ dispatch:
 		if err := handleFolders(acc); err != nil {
 			fatal("folders: %v", err)
 		}
+	case "watch":
+		opts := parseWatchFlags(cmdArgs)
+		if err := handleWatch(acc, opts); err != nil {
+			fatal("watch: %v", err)
+		}
 	default:
 		fatal("unknown command '%s'", cmd)
 	}
@@ -607,6 +612,83 @@ func handleInit() error {
 	return nil
 }
 
+// --- Watch command ---
+
+type watchFlags struct {
+	folder     string
+	handler    string
+	pollOnly   bool
+	once       bool
+}
+
+func parseWatchFlags(args []string) watchFlags {
+	var f watchFlags
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-folder":
+			i++
+			f.folder = args[i]
+		case "-handler":
+			i++
+			f.handler = args[i]
+		case "-poll-only":
+			f.pollOnly = true
+		case "-once":
+			f.once = true
+		default:
+			fatal("watch: unknown flag '%s'", args[i])
+		}
+	}
+	return f
+}
+
+func handleWatch(acc *config.AccountConfig, opts watchFlags) error {
+	// Check if IMAP is configured
+	if acc.IMAP.Host == "" {
+		return fmt.Errorf("watch mode requires IMAP configuration")
+	}
+
+	// Build watch options from config and flags
+	watchOpts := email.WatchOptions{
+		Folder:     opts.folder,
+		HandlerCmd: opts.handler,
+		PollOnly:   opts.pollOnly,
+		Once:       opts.once,
+	}
+
+	// Apply config defaults if specified
+	if acc.Watch != nil {
+		if watchOpts.Folder == "" && acc.Watch.Folder != "" {
+			watchOpts.Folder = acc.Watch.Folder
+		}
+		if watchOpts.HandlerCmd == "" && acc.Watch.HandlerCmd != "" {
+			watchOpts.HandlerCmd = acc.Watch.HandlerCmd
+		}
+		if acc.Watch.KeepAlive > 0 {
+			watchOpts.KeepAlive = acc.Watch.KeepAlive
+		}
+		if acc.Watch.PollInterval > 0 {
+			watchOpts.PollInterval = acc.Watch.PollInterval
+		}
+		if acc.Watch.MaxRetries > 0 {
+			watchOpts.MaxRetries = acc.Watch.MaxRetries
+		}
+	}
+
+	// Create IMAP client
+	client := email.NewIMAPClient(email.IMAPConfig{
+		Host:     acc.IMAP.Host,
+		Port:     acc.IMAP.Port,
+		Username: acc.IMAP.Username,
+		Password: acc.IMAP.Password,
+		SSL:      acc.IMAP.SSL,
+		StartTLS: acc.IMAP.StartTLS,
+	})
+
+	// Start watching
+	return client.Watch(watchOpts)
+}
+
 // --- Utility functions ---
 
 func parseAddressList(s string) []email.Address {
@@ -658,6 +740,7 @@ Commands:
   fetch      Fetch and display an email
   delete     Delete an email
   folders    List all folders
+  watch      Watch for new emails (IMAP only)
   init       Initialize configuration file
 
 Global Options:
@@ -698,6 +781,18 @@ Delete Options:
   -expunge             Permanently remove (expunge) the message (IMAP only)
   -protocol <proto>    Force protocol: imap or pop3 (auto-detected)
 
+Watch Options:
+  -folder <name>       Folder to watch (default: INBOX)
+  -handler <cmd>       Handler command for new emails (receives raw EML via stdin)
+  -poll-only          Force polling mode (disable IDLE)
+  -once               Process existing emails then exit
+
+Watch Handler:
+  The handler receives the raw RFC 5322 email via stdin. Exit code 0 marks as processed.
+  Use emx-save to save emails as .eml files:
+  - Build: go build -o emx-save.exe ./cmd/emx-save
+  - Use:   emx-mail watch -handler "emx-save ./emails"
+
 Examples:
   emx-mail list
   emx-mail -v list -limit 5
@@ -706,5 +801,7 @@ Examples:
   emx-mail delete -uid 12345 -expunge
   emx-mail folders
   emx-mail init
+  emx-mail watch -handler "emx-save ./emails"
+  emx-mail watch -once -handler "emx-save ./emails"
 `, version)
 }
