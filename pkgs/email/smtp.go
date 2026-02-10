@@ -2,10 +2,13 @@ package email
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-message/mail"
@@ -40,6 +43,8 @@ func NewSMTPClient(config SMTPConfig) *SMTPClient {
 func (c *SMTPClient) Connect() error {
 	var dialFn func(addr string, tlsConfig *tls.Config) (*smtp.Client, error)
 
+	tlsCfg := &tls.Config{ServerName: c.config.Host}
+
 	if c.config.SSL {
 		dialFn = smtp.DialTLS
 	} else if c.config.StartTLS {
@@ -51,7 +56,7 @@ func (c *SMTPClient) Connect() error {
 	}
 
 	addr := fmt.Sprintf("%s:%d", c.config.Host, c.config.Port)
-	client, err := dialFn(addr, nil)
+	client, err := dialFn(addr, tlsCfg)
 	if err != nil {
 		return fmt.Errorf("failed to connect to SMTP server: %w", err)
 	}
@@ -147,9 +152,9 @@ func (c *SMTPClient) buildMessage(opts SendOptions) (*bytes.Buffer, error) {
 		header.SetMsgIDList("References", opts.References)
 	}
 
-	// Generate Message-ID if not replying
+	// Generate Message-ID
 	if opts.InReplyTo == "" {
-		header.Set("Message-ID", fmt.Sprintf("<%d@emx-mail>", time.Now().UnixNano()))
+		header.Set("Message-ID", GenerateMessageID(opts.From.Email))
 	}
 
 	// Create multipart writer
@@ -262,4 +267,20 @@ func SendQuickSMTP(host string, port int, username, password string, useSSL bool
 	})
 
 	return client.Send(opts)
+}
+
+// GenerateMessageID produces a RFC 5322 compliant Message-ID using the
+// domain extracted from the sender's email address.
+// Format: <timestamp.random@domain>
+func GenerateMessageID(fromEmail string) string {
+	domain := "localhost"
+	if idx := strings.Index(fromEmail, "@"); idx >= 0 {
+		domain = fromEmail[idx+1:]
+	}
+
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	randomPart := hex.EncodeToString(b)
+
+	return fmt.Sprintf("<%d.%s@%s>", time.Now().UnixNano(), randomPart, domain)
 }

@@ -66,6 +66,7 @@ type FileStatus struct {
 	CompressedSize   int64  `json:"compressed_size"`
 	UncompressedSize int64  `json:"uncompressed_size"`
 	LineCount        int64  `json:"line_count"`
+	FirstLineHash    string `json:"first_line_hash,omitempty"`
 	IsLatest         bool   `json:"is_latest"`
 }
 

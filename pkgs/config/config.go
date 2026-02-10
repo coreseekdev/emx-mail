@@ -17,6 +17,19 @@ const (
 	EnvConfigJSONPath = "EMX_MAIL_CONFIG_JSON"
 )
 
+// ProtocolSettings holds connection settings common to IMAP, POP3 and SMTP.
+type ProtocolSettings struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password,omitempty"`
+
+	// SSL enables implicit TLS (connect directly over TLS).
+	SSL bool `json:"ssl"`
+	// StartTLS enables opportunistic TLS upgrade after connecting in plaintext.
+	StartTLS bool `json:"starttls"`
+}
+
 // AccountConfig holds email account configuration
 //
 // NOTE: This structure mirrors the emx-config nested config schema.
@@ -26,43 +39,21 @@ type AccountConfig struct {
 	Email    string `json:"email"`
 	FromName string `json:"from_name,omitempty"`
 
-	// IMAP settings
-	IMAP struct {
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		Username string `json:"username"`
-		Password string `json:"password,omitempty"`
-
-		// SSL or implicit TLS
-		SSL bool `json:"ssl"`
-		// Start TLS
-		StartTLS bool `json:"starttls"`
-	} `json:"imap"`
-
-	// POP3 settings
-	POP3 struct {
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		Username string `json:"username"`
-		Password string `json:"password,omitempty"`
-
-		SSL      bool `json:"ssl"`
-		StartTLS bool `json:"starttls"`
-	} `json:"pop3"`
-
-	// SMTP settings
-	SMTP struct {
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		Username string `json:"username"`
-		Password string `json:"password,omitempty"`
-
-		SSL      bool `json:"ssl"`
-		StartTLS bool `json:"starttls"`
-	} `json:"smtp"`
+	IMAP ProtocolSettings `json:"imap"`
+	POP3 ProtocolSettings `json:"pop3"`
+	SMTP ProtocolSettings `json:"smtp"`
 
 	// Watch settings
 	Watch *WatchConfig `json:"watch,omitempty"`
+}
+
+// Domain returns the domain part of the account email address.
+// Returns "localhost" if no domain can be extracted.
+func (a *AccountConfig) Domain() string {
+	if idx := strings.Index(a.Email, "@"); idx >= 0 {
+		return a.Email[idx+1:]
+	}
+	return "localhost"
 }
 
 // WatchConfig holds watch mode configuration
@@ -219,40 +210,19 @@ func ExampleRootConfig() *RootConfig {
 					Name:     "Work Account",
 					Email:    "user@example.com",
 					FromName: "Your Name",
-					IMAP: struct {
-						Host     string `json:"host"`
-						Port     int    `json:"port"`
-						Username string `json:"username"`
-						Password string `json:"password,omitempty"`
-						SSL      bool   `json:"ssl"`
-						StartTLS bool   `json:"starttls"`
-					}{
+					IMAP: ProtocolSettings{
 						Host:     "imap.example.com",
 						Port:     993,
 						Username: "user@example.com",
 						SSL:      true,
 					},
-					SMTP: struct {
-						Host     string `json:"host"`
-						Port     int    `json:"port"`
-						Username string `json:"username"`
-						Password string `json:"password,omitempty"`
-						SSL      bool   `json:"ssl"`
-						StartTLS bool   `json:"starttls"`
-					}{
+					SMTP: ProtocolSettings{
 						Host:     "smtp.example.com",
 						Port:     587,
 						Username: "user@example.com",
 						StartTLS: true,
 					},
-					POP3: struct {
-						Host     string `json:"host"`
-						Port     int    `json:"port"`
-						Username string `json:"username"`
-						Password string `json:"password,omitempty"`
-						SSL      bool   `json:"ssl"`
-						StartTLS bool   `json:"starttls"`
-					}{
+					POP3: ProtocolSettings{
 						Host:     "pop3.example.com",
 						Port:     995,
 						Username: "user@example.com",

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -233,7 +234,7 @@ func (b *Bus) Status(name string) (*FileStatus, error) {
 	}
 
 	// Read file to get uncompressed size and line count
-	uncompressedSize, lineCount, err := b.getFileStats(name)
+	uncompressedSize, lineCount, firstLineHash, err := b.getFileStats(name)
 	if err != nil {
 		return nil, err
 	}
@@ -245,6 +246,7 @@ func (b *Bus) Status(name string) (*FileStatus, error) {
 		CompressedSize:   fi.Size(),
 		UncompressedSize: uncompressedSize,
 		LineCount:        lineCount,
+		FirstLineHash:    firstLineHash,
 		IsLatest:         name == latestName,
 	}, nil
 }
@@ -280,14 +282,21 @@ func (b *Bus) lock() (func(), error) {
 			break
 		}
 		if os.IsExist(err) {
-			// Check if lock file is stale (older than 30 seconds is considered stale)
-			if fi, serr := os.Stat(lockPath); serr == nil {
-				if time.Since(fi.ModTime()) > 30*time.Second {
-					os.Remove(lockPath)
-					continue
+			// Check if lock holder is still alive by reading PID
+			if data, rerr := os.ReadFile(lockPath); rerr == nil {
+				if pid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil {
+					proc, _ := os.FindProcess(pid)
+					// On Unix, FindProcess always succeeds; use Signal(0) to check.
+					// On Windows, FindProcess fails for non-existent PIDs.
+					if proc != nil && proc.Signal(nil) == nil {
+						// Process exists — lock is held; wait and retry
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
 				}
 			}
-			time.Sleep(100 * time.Millisecond)
+			// PID missing, unparseable, or process dead — stale lock
+			os.Remove(lockPath)
 			continue
 		}
 		return nil, fmt.Errorf("failed to create lock file: %w", err)
@@ -295,6 +304,8 @@ func (b *Bus) lock() (func(), error) {
 	if f == nil {
 		return nil, fmt.Errorf("failed to acquire lock: %s", lockPath)
 	}
+	// Write our PID into the lock file
+	fmt.Fprintf(f, "%d", os.Getpid())
 	f.Close()
 
 	// Clear tracking on lock acquisition
@@ -411,26 +422,26 @@ func parseSeq(name string) int {
 }
 
 // getFileStats calculates uncompressed size and line count by reading the file.
-func (b *Bus) getFileStats(name string) (int64, int64, error) {
+func (b *Bus) getFileStats(name string) (uncompressedSize int64, lineCount int64, firstLineHash string, err error) {
 	fpath := filepath.Join(b.Dir, name)
 	f, err := os.Open(fpath)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	defer f.Close()
 
 	// Check if file is empty
 	fi, err := f.Stat()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	if fi.Size() == 0 {
-		return 0, 0, nil
+		return 0, 0, "", nil
 	}
 
 	gr, err := gzip.NewReader(f)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to open gzip: %w", err)
+		return 0, 0, "", fmt.Errorf("failed to open gzip: %w", err)
 	}
 	defer gr.Close()
 
@@ -438,18 +449,24 @@ func (b *Bus) getFileStats(name string) (int64, int64, error) {
 
 	data, err := io.ReadAll(gr)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to decompress: %w", err)
+		return 0, 0, "", fmt.Errorf("failed to decompress: %w", err)
 	}
 
-	lineCount := int64(0)
+	lc := int64(0)
+	firstLine := ""
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) > 0 {
-			lineCount++
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) > 0 {
+			if lc == 0 {
+				h := sha256.Sum256(line)
+				firstLine = fmt.Sprintf("%x", h[:8]) // 16-char hex prefix
+			}
+			lc++
 		}
 	}
 
-	return int64(len(data)), lineCount, scanner.Err()
+	return int64(len(data)), lc, firstLine, scanner.Err()
 }
 
 // readFile reads events from a gzip file, starting from the specified uncompressed byte offset.

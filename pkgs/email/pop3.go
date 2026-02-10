@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net"
 	"strconv"
@@ -25,11 +24,13 @@ type POP3Client struct {
 
 // POP3Config holds POP3 configuration
 type POP3Config struct {
-	Host     string
-	Port     int
-	Username string
-	Password string
-	SSL      bool
+	Host      string
+	Port      int
+	Username  string
+	Password  string
+	SSL       bool
+	StartTLS  bool
+	TLSConfig *tls.Config // optional; if nil a default config is used
 }
 
 // NewPOP3Client creates a new POP3 client
@@ -134,6 +135,32 @@ func (c *POP3Client) DeleteMessage(msgID uint32) error {
 	return conn.quit()
 }
 
+// FetchMessageByID implements MailReceiver.
+func (c *POP3Client) FetchMessageByID(_ string, uid uint32) (*Message, error) {
+	return c.FetchMessage(uid)
+}
+
+// DeleteMessageByID implements MailReceiver.
+func (c *POP3Client) DeleteMessageByID(_ string, uid uint32, _ bool) error {
+	return c.DeleteMessage(uid)
+}
+
+// Close implements MailReceiver (POP3 connections are per-operation).
+func (c *POP3Client) Close() error { return nil }
+
+// tlsConfig returns the TLS configuration to use. If none is set in the
+// config, a sensible default with the server name is returned.
+func (c *POP3Client) tlsConfig() *tls.Config {
+	if c.config.TLSConfig != nil {
+		cfg := c.config.TLSConfig.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = c.config.Host
+		}
+		return cfg
+	}
+	return &tls.Config{ServerName: c.config.Host}
+}
+
 // ListMessageIDs returns all message (id, size) pairs.
 func (c *POP3Client) ListMessageIDs() ([]POP3MessageID, error) {
 	conn, err := c.connect()
@@ -147,6 +174,11 @@ func (c *POP3Client) ListMessageIDs() ([]POP3MessageID, error) {
 
 // connect dials and authenticates to the POP3 server.
 func (c *POP3Client) connect() (*pop3Conn, error) {
+	// Require encryption — refuse plaintext connections
+	if !c.config.SSL && !c.config.StartTLS {
+		return nil, fmt.Errorf("POP3 requires SSL or StartTLS; plaintext connections are not allowed")
+	}
+
 	addr := net.JoinHostPort(c.config.Host, fmt.Sprintf("%d", c.config.Port))
 
 	var netConn net.Conn
@@ -155,15 +187,17 @@ func (c *POP3Client) connect() (*pop3Conn, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 
 	if c.config.SSL {
-		netConn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-			ServerName: c.config.Host,
-		})
+		tlsCfg := c.tlsConfig()
+		netConn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
 	} else {
 		netConn, err = dialer.Dial("tcp", addr)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("POP3 connection to %s failed: %w", addr, err)
 	}
+
+	// Set read/write deadline for the entire session (5 minutes).
+	netConn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	conn := &pop3Conn{
 		conn: netConn,
@@ -177,9 +211,31 @@ func (c *POP3Client) connect() (*pop3Conn, error) {
 		return nil, fmt.Errorf("POP3 greeting failed: %w", err)
 	}
 
+	// Upgrade to TLS via STLS if needed
+	if c.config.StartTLS && !c.config.SSL {
+		if err := conn.send("STLS"); err != nil {
+			netConn.Close()
+			return nil, fmt.Errorf("POP3 STLS command failed: %w", err)
+		}
+		if _, err := conn.readOne(); err != nil {
+			netConn.Close()
+			return nil, fmt.Errorf("POP3 STLS negotiation failed: %w", err)
+		}
+		tlsConn := tls.Client(netConn, c.tlsConfig())
+		if err := tlsConn.Handshake(); err != nil {
+			netConn.Close()
+			return nil, fmt.Errorf("POP3 TLS handshake failed: %w", err)
+		}
+		conn.conn = tlsConn
+		conn.r = bufio.NewReader(tlsConn)
+		conn.w = bufio.NewWriter(tlsConn)
+		// Reset deadline on upgraded connection
+		tlsConn.SetDeadline(time.Now().Add(5 * time.Minute))
+	}
+
 	// Authenticate
 	if err := conn.auth(c.config.Username, c.config.Password); err != nil {
-		netConn.Close()
+		conn.conn.Close()
 		return nil, fmt.Errorf("POP3 authentication failed: %w", err)
 	}
 
@@ -453,70 +509,13 @@ func pop3EntityToMessage(entity *gomessage.Entity, seqNum uint32) *Message {
 
 // parsePOP3EntityBody reads the body of an entity into TextBody/HTMLBody.
 func parsePOP3EntityBody(msg *Message, entity *gomessage.Entity) {
-	if mr := entity.MultipartReader(); mr != nil {
-		for {
-			part, err := mr.NextPart()
-			if err != nil {
-				break
-			}
-			ct, _, _ := part.Header.ContentType()
-			body, err := io.ReadAll(part.Body)
-			if err != nil {
-				continue
-			}
-			switch {
-			case strings.HasPrefix(ct, "text/plain") && msg.TextBody == "":
-				msg.TextBody = string(body)
-			case strings.HasPrefix(ct, "text/html") && msg.HTMLBody == "":
-				msg.HTMLBody = string(body)
-			case strings.HasPrefix(ct, "multipart/"):
-				parseNestedPOP3Multipart(msg, part)
-			default:
-				ah := mail.AttachmentHeader{Header: part.Header}
-				filename, _ := ah.Filename()
-				msg.Attachments = append(msg.Attachments, Attachment{
-					Filename:    filename,
-					ContentType: ct,
-					Size:        int64(len(body)),
-					Data:        body, // Store attachment data
-				})
-			}
-		}
-	} else {
-		ct, _, _ := entity.Header.ContentType()
-		body, err := io.ReadAll(entity.Body)
-		if err != nil {
-			return
-		}
-		if strings.HasPrefix(ct, "text/html") {
-			msg.HTMLBody = string(body)
-		} else {
-			msg.TextBody = string(body)
-		}
-	}
+	parseEntityBody(msg, entity)
 }
 
 func parseNestedPOP3Multipart(msg *Message, entity *gomessage.Entity) {
-	mr := entity.MultipartReader()
-	if mr == nil {
-		return
-	}
-	for {
-		part, err := mr.NextPart()
-		if err != nil {
-			break
-		}
-		ct, _, _ := part.Header.ContentType()
-		body, err := io.ReadAll(part.Body)
-		if err != nil {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(ct, "text/plain") && msg.TextBody == "":
-			msg.TextBody = string(body)
-		case strings.HasPrefix(ct, "text/html") && msg.HTMLBody == "":
-			msg.HTMLBody = string(body)
-		}
+	// Handled by the recursive parseMultipart in body.go — kept for signature compat.
+	if nested := entity.MultipartReader(); nested != nil {
+		parseMultipart(msg, nested)
 	}
 }
 

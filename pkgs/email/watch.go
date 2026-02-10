@@ -1,7 +1,6 @@
 package email
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 // WatchOptions holds options for watch mode
@@ -26,7 +26,7 @@ type WatchOptions struct {
 
 // WatchStatus represents a status message type
 type WatchStatus struct {
-	Type    string `json:"type"`           // "connection", "idle", "process", "mark", "error"
+	Type    string `json:"type"`            // "connection", "idle", "process", "mark", "error"
 	Level   string `json:"level,omitempty"` // "info", "warn", "error"
 	Message string `json:"message"`
 	UID     uint32 `json:"uid,omitempty"`
@@ -230,11 +230,14 @@ func (c *IMAPClient) processEmail(uid uint32, opts WatchOptions, statusWrite fun
 		return fmt.Errorf("failed to fetch metadata: %w", err)
 	}
 
-	// Fetch full email (RFC 5322 format)
-	rawEmail, err := c.fetchRawEmail(uid)
+	// Fetch full email as a streaming reader (RFC 5322 format).
+	// The reader is backed by the IMAP connection and does not buffer the
+	// entire message in memory.
+	emailReader, cleanup, err := c.fetchRawEmailReader(uid)
 	if err != nil {
 		return fmt.Errorf("failed to fetch email: %w", err)
 	}
+	defer cleanup()
 
 	// Notify stdout about new email
 	notification := EmailNotification{
@@ -269,7 +272,7 @@ func (c *IMAPClient) processEmail(uid uint32, opts WatchOptions, statusWrite fun
 		UID:     uid,
 	})
 
-	exitCode, err := c.runHandler(opts.HandlerCmd, rawEmail)
+	exitCode, err := c.runHandler(opts.HandlerCmd, emailReader)
 	if err != nil {
 		return fmt.Errorf("handler execution failed: %w", err)
 	}
@@ -347,38 +350,63 @@ func convertFlags(flags []imap.Flag) []string {
 	return result
 }
 
-// fetchRawEmail fetches the raw RFC 5322 email
-func (c *IMAPClient) fetchRawEmail(uid uint32) ([]byte, error) {
+// fetchRawEmailReader fetches the raw RFC 5322 email as a streaming reader.
+// It returns:
+//   - reader: an io.Reader backed by the IMAP literal (OS-pipe friendly).
+//   - cleanup: must be called after the reader is fully consumed to release
+//     the underlying IMAP fetch command.
+//   - err: any error from the IMAP FETCH.
+//
+// This avoids buffering the entire message in memory. The caller should pipe
+// the reader into the handler's stdin via os.Pipe / exec.Cmd.StdinPipe so
+// that the kernel pipe buffer (~64 KB) controls peak memory usage.
+func (c *IMAPClient) fetchRawEmailReader(uid uint32) (io.Reader, func(), error) {
 	uidSet := imap.UIDSetNum(imap.UID(uid))
 	bodySection := &imap.FetchItemBodySection{Peek: true}
-	msgs, err := c.client.Fetch(uidSet, &imap.FetchOptions{
+	fetchCmd := c.client.Fetch(uidSet, &imap.FetchOptions{
 		BodySection: []*imap.FetchItemBodySection{bodySection},
-	}).Collect()
+	})
 
-	if err != nil {
-		return nil, err
+	msg := fetchCmd.Next()
+	if msg == nil {
+		fetchCmd.Close()
+		return nil, func() {}, fmt.Errorf("no messages returned for UID %d", uid)
 	}
 
-	if len(msgs) == 0 {
-		return nil, fmt.Errorf("no messages returned for UID %d", uid)
+	// Iterate the message's data items to find the body section literal.
+	var literal io.Reader
+	for {
+		item := msg.Next()
+		if item == nil {
+			break
+		}
+		if bs, ok := item.(imapclient.FetchItemDataBodySection); ok {
+			if bs.Literal != nil {
+				literal = bs.Literal
+				break
+			}
+		}
 	}
 
-	msg := msgs[0]
-	rawBody := msg.FindBodySection(bodySection)
-	if rawBody == nil {
-		return nil, fmt.Errorf("no body section returned")
+	if literal == nil {
+		fetchCmd.Close()
+		return nil, func() {}, fmt.Errorf("no body section returned for UID %d", uid)
 	}
 
-	data, err := io.ReadAll(bytes.NewReader(rawBody))
-	if err != nil {
-		return nil, err
+	// cleanup drains remaining items and closes the fetch command so that the
+	// IMAP client can proceed with subsequent commands.
+	cleanup := func() {
+		fetchCmd.Close()
 	}
 
-	return data, nil
+	return literal, cleanup, nil
 }
 
-// runHandler executes the handler program with the email as stdin
-func (c *IMAPClient) runHandler(cmd string, emailData []byte) (int, error) {
+// runHandler executes the handler program, streaming emailReader into the
+// process's stdin through an OS pipe. The kernel pipe buffer (~64 KB on
+// Linux, ~1 MB on macOS) provides automatic back-pressure so peak memory
+// usage stays bounded regardless of email size.
+func (c *IMAPClient) runHandler(cmd string, emailReader io.Reader) (int, error) {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return 0, fmt.Errorf("empty handler command")
@@ -388,16 +416,42 @@ func (c *IMAPClient) runHandler(cmd string, emailData []byte) (int, error) {
 	args := parts[1:]
 
 	cmdObj := exec.Command(cmdExec, args...)
-	cmdObj.Stdin = strings.NewReader(string(emailData))
 	cmdObj.Stdout = os.Stderr // Handler stdout goes to stderr
 	cmdObj.Stderr = os.Stderr
 
-	err := cmdObj.Run()
+	stdinPipe, err := cmdObj.StdinPipe()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		return 0, fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	if err := cmdObj.Start(); err != nil {
+		return 0, fmt.Errorf("failed to start handler: %w", err)
+	}
+
+	// Stream email data into the handler's stdin via the OS pipe.
+	// io.Copy reads/writes in 32 KB chunks; the kernel pipe buffer
+	// handles back-pressure automatically.
+	writeErr := make(chan error, 1)
+	go func() {
+		_, werr := io.Copy(stdinPipe, emailReader)
+		stdinPipe.Close() // signals EOF to the handler
+		writeErr <- werr
+	}()
+
+	waitErr := cmdObj.Wait()
+
+	// Prefer the process exit error; surface write errors only if the
+	// process itself succeeded (e.g. broken pipe is expected when the
+	// handler exits early).
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			return exitErr.ExitCode(), nil
 		}
-		return 1, err
+		return 1, waitErr
+	}
+
+	if wErr := <-writeErr; wErr != nil {
+		return 1, fmt.Errorf("failed writing to handler stdin: %w", wErr)
 	}
 
 	return 0, nil
@@ -435,9 +489,6 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 		Message: "IDLE mode started",
 	})
 
-	ticker := time.NewTicker(time.Duration(opts.KeepAlive) * time.Second)
-	defer ticker.Stop()
-
 	for {
 		// Start IDLE
 		idleCmd, err := c.client.Idle()
@@ -448,7 +499,10 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 			return fmt.Errorf("IDLE wait failed: %w", err)
 		}
 
-		// Wait for updates or timeout
+		// Wait for updates or timeout.
+		// The goroutine waits for server-side IDLE events;
+		// buffered channel ensures it can exit even if we time out first,
+		// and idleCmd.Close() ensures Wait() returns promptly.
 		done := make(chan struct{}, 1)
 		go func() {
 			idleCmd.Wait()
@@ -459,6 +513,8 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 		case <-time.After(29 * time.Minute):
 			// IDLE timeout (29 min is recommended max)
 			idleCmd.Close()
+			// Drain goroutine — Close() unblocks Wait().
+			<-done
 			statusWrite(WatchStatus{
 				Type:    "idle",
 				Level:   "info",
@@ -472,33 +528,28 @@ func (c *IMAPClient) watchIDLE(opts WatchOptions, statusWrite func(WatchStatus))
 				Level:   "info",
 				Message: "IDLE response received",
 			})
-
-			// Check for new emails
-			if err := c.processUnprocessed(opts, statusWrite); err != nil {
-				statusWrite(WatchStatus{
-					Type:    "error",
-					Level:   "error",
-					Message: fmt.Sprintf("Failed to process new emails: %v", err),
-				})
-			}
 		}
 
-		// Keep-alive NOOP
-		select {
-		case <-ticker.C:
-			if err := c.client.Noop().Wait(); err != nil {
-				statusWrite(WatchStatus{
-					Type:    "connection",
-					Level:   "error",
-					Message: fmt.Sprintf("NOOP failed: %v", err),
-				})
-				// Try to reconnect
-				if err := c.reconnect(opts, statusWrite); err != nil {
-					return err
-				}
+		// Process new emails
+		if err := c.processUnprocessed(opts, statusWrite); err != nil {
+			statusWrite(WatchStatus{
+				Type:    "error",
+				Level:   "error",
+				Message: fmt.Sprintf("Failed to process new emails: %v", err),
+			})
+		}
+
+		// NOOP to keep connection alive
+		if err := c.client.Noop().Wait(); err != nil {
+			statusWrite(WatchStatus{
+				Type:    "connection",
+				Level:   "error",
+				Message: fmt.Sprintf("NOOP failed: %v", err),
+			})
+			// Try to reconnect
+			if err := c.reconnect(opts, statusWrite); err != nil {
+				return err
 			}
-		default:
-			// Don't block if ticker hasn't fired
 		}
 	}
 }

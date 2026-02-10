@@ -1,6 +1,8 @@
 package patchwork
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -254,8 +256,14 @@ func (pb *PrepBranch) Reroll() error {
 }
 
 // generateChangeID creates a unique change identifier from the slug.
+// Format: <slug>-<random-hex> to ensure uniqueness across branches.
 func generateChangeID(slug string) string {
-	return slug
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to slug only if crypto/rand fails (extremely unlikely)
+		return slug
+	}
+	return fmt.Sprintf("%s-%s", slug, hex.EncodeToString(b))
 }
 
 // ListPrepBranches lists all prep branches in the repository.

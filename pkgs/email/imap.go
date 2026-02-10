@@ -3,13 +3,11 @@ package email
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomessage "github.com/emersion/go-message"
-	"github.com/emersion/go-message/mail"
 )
 
 // IMAPClient represents an IMAP client
@@ -273,6 +271,16 @@ func (c *IMAPClient) DeleteMessage(folder string, uid uint32, expunge bool) erro
 	return nil
 }
 
+// FetchMessageByID implements MailReceiver.
+func (c *IMAPClient) FetchMessageByID(folder string, uid uint32) (*Message, error) {
+	return c.FetchMessage(folder, uid)
+}
+
+// DeleteMessageByID implements MailReceiver.
+func (c *IMAPClient) DeleteMessageByID(folder string, uid uint32, expunge bool) error {
+	return c.DeleteMessage(folder, uid, expunge)
+}
+
 // MarkAsSeen marks a message as seen
 func (c *IMAPClient) MarkAsSeen(folder string, uid uint32) error {
 	cleanup, err := c.ensureConnected()
@@ -371,74 +379,5 @@ func parseIMAPMessageBody(msg *Message, raw []byte) {
 		return
 	}
 
-	if mr := entity.MultipartReader(); mr != nil {
-		// Multipart message
-		for {
-			part, err := mr.NextPart()
-			if err != nil {
-				break
-			}
-			ct, _, _ := part.Header.ContentType()
-			body, err := io.ReadAll(part.Body)
-			if err != nil {
-				continue
-			}
-			switch {
-			case strings.HasPrefix(ct, "text/plain"):
-				msg.TextBody = string(body)
-			case strings.HasPrefix(ct, "text/html"):
-				msg.HTMLBody = string(body)
-			case strings.HasPrefix(ct, "multipart/"):
-				// Nested multipart — parse inline parts
-				parseNestedIMAPMultipart(msg, part)
-			default:
-				// Attachment
-				h := mail.AttachmentHeader{Header: part.Header}
-				filename, _ := h.Filename()
-				msg.Attachments = append(msg.Attachments, Attachment{
-					Filename:    filename,
-					ContentType: ct,
-					Size:        int64(len(body)),
-					Data:        body, // Store attachment data
-				})
-			}
-		}
-	} else {
-		// Single-part message
-		ct, _, _ := entity.Header.ContentType()
-		body, err := io.ReadAll(entity.Body)
-		if err != nil {
-			return
-		}
-		if strings.HasPrefix(ct, "text/html") {
-			msg.HTMLBody = string(body)
-		} else {
-			msg.TextBody = string(body)
-		}
-	}
-}
-
-// parseNestedIMAPMultipart handles nested multipart structures (e.g., multipart/alternative inside multipart/mixed)
-func parseNestedIMAPMultipart(msg *Message, entity *gomessage.Entity) {
-	mr := entity.MultipartReader()
-	if mr == nil {
-		return
-	}
-	for {
-		part, err := mr.NextPart()
-		if err != nil {
-			break
-		}
-		ct, _, _ := part.Header.ContentType()
-		body, err := io.ReadAll(part.Body)
-		if err != nil {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(ct, "text/plain") && msg.TextBody == "":
-			msg.TextBody = string(body)
-		case strings.HasPrefix(ct, "text/html") && msg.HTMLBody == "":
-			msg.HTMLBody = string(body)
-		}
-	}
+	parseEntityBody(msg, entity)
 }

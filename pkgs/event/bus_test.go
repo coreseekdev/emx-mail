@@ -182,7 +182,7 @@ func TestBusAddSingle(t *testing.T) {
 
 	// Check file stats (no more meta file)
 	name, _ := bus.latestName()
-	uncompressedSize, lineCount, err := bus.getFileStats(name)
+	uncompressedSize, lineCount, _, err := bus.getFileStats(name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestBusAddMultiple(t *testing.T) {
 	}
 
 	name, _ := bus.latestName()
-	uncompressedSize, lineCount, err := bus.getFileStats(name)
+	uncompressedSize, lineCount, _, err := bus.getFileStats(name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestBusRotation(t *testing.T) {
 	}
 
 	// New file should have 1 record (rotate event)
-	_, lineCount, err := bus.getFileStats(name)
+	_, lineCount, _, err := bus.getFileStats(name)
 	if err != nil {
 		t.Fatal(err)
 	}
