@@ -1,6 +1,8 @@
 package event
 
 import (
+	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,21 +11,21 @@ import (
 	"testing"
 )
 
-// --- Event 类型测试 ---
+// --- Event type tests ---
 
 func TestGenerateID(t *testing.T) {
 	id1 := generateID()
 	id2 := generateID()
 
 	if id1 == "" {
-		t.Fatal("生成的 ID 为空")
+		t.Fatal("generated ID is empty")
 	}
 	if id1 == id2 {
-		t.Fatalf("两次生成的 ID 相同: %s", id1)
+		t.Fatalf("two generated IDs are the same: %s", id1)
 	}
-	// 格式: 20060102T150405-xxxxxxxx
+	// Format: 20060102T150405-xxxxxxxx
 	if !strings.Contains(id1, "T") || !strings.Contains(id1, "-") {
-		t.Fatalf("ID 格式不正确: %s", id1)
+		t.Fatalf("ID format incorrect: %s", id1)
 	}
 }
 
@@ -33,13 +35,30 @@ func TestHashLine(t *testing.T) {
 	h3 := hashLine([]byte("world\n"))
 
 	if h1 != h2 {
-		t.Fatal("相同输入应产生相同 hash")
+		t.Fatal("same input should produce same hash")
 	}
 	if h1 == h3 {
-		t.Fatal("不同输入应产生不同 hash")
+		t.Fatal("different input should produce different hash")
 	}
-	if !strings.HasPrefix(h1, "sha256:") {
-		t.Fatalf("hash 应以 sha256: 开头: %s", h1)
+	// hashLine returns first 8 chars of hex hash
+	if len(h1) != 8 {
+		t.Fatalf("hash length should be 8, got: %s", h1)
+	}
+}
+
+func TestGenerateUUID(t *testing.T) {
+	uuid1 := generateUUID()
+	uuid2 := generateUUID()
+
+	if uuid1 == "" {
+		t.Fatal("generated UUID is empty")
+	}
+	if uuid1 == uuid2 {
+		t.Fatal("two generated UUIDs are the same")
+	}
+	// UUID is 32 hex chars
+	if len(uuid1) != 32 {
+		t.Fatalf("UUID length should be 32, got: %d", len(uuid1))
 	}
 }
 
@@ -50,9 +69,9 @@ func TestParsePosition(t *testing.T) {
 		offset  int64
 		wantErr bool
 	}{
-		{"events.001.jsonl.gz:1024", "events.001.jsonl.gz", 1024, false},
-		{"events.999.jsonl.gz:0", "events.999.jsonl.gz", 0, false},
-		{"events.001.jsonl.gz:999999", "events.001.jsonl.gz", 999999, false},
+		{"events.001-a1b2c3d4.jsonl.gz:1024", "events.001-a1b2c3d4.jsonl.gz", 1024, false},
+		{"events.999-e5f6g7h8.jsonl.gz:0", "events.999-e5f6g7h8.jsonl.gz", 0, false},
+		{"events.001-a1b2c3d4.jsonl.gz:999999", "events.001-a1b2c3d4.jsonl.gz", 999999, false},
 		{"invalid", "", 0, true},
 		{"", "", 0, true},
 		{":123", "", 0, true},
@@ -77,30 +96,30 @@ func TestParsePosition(t *testing.T) {
 }
 
 func TestPositionString(t *testing.T) {
-	p := Position{File: "events.001.jsonl.gz", Offset: 2048}
+	p := Position{File: "events.001-a1b2c3d4.jsonl.gz", Offset: 2048}
 	s := p.String()
-	if s != "events.001.jsonl.gz:2048" {
-		t.Fatalf("String() = %q, want %q", s, "events.001.jsonl.gz:2048")
+	if s != "events.001-a1b2c3d4.jsonl.gz:2048" {
+		t.Fatalf("String() = %q, want %q", s, "events.001-a1b2c3d4.jsonl.gz:2048")
 	}
 
-	// 往返测试
+	// Round-trip test
 	p2, err := ParsePosition(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p2.File != p.File || p2.Offset != p.Offset {
-		t.Fatalf("往返失败: %+v != %+v", p2, p)
+		t.Fatalf("round-trip failed: %+v != %+v", p2, p)
 	}
 }
 
-// --- Bus 核心测试 ---
+// --- Bus core tests ---
 
 func setupTestBus(t *testing.T) *Bus {
 	t.Helper()
 	dir := t.TempDir()
 	bus := NewBus(filepath.Join(dir, "events"))
 	if err := bus.Init(); err != nil {
-		t.Fatalf("Init 失败: %v", err)
+		t.Fatalf("Init failed: %v", err)
 	}
 	return bus
 }
@@ -108,33 +127,34 @@ func setupTestBus(t *testing.T) *Bus {
 func TestBusInit(t *testing.T) {
 	bus := setupTestBus(t)
 
-	// 应该创建了目录
+	// Should have created directory
 	if _, err := os.Stat(bus.Dir); err != nil {
-		t.Fatalf("目录不存在: %v", err)
+		t.Fatalf("directory does not exist: %v", err)
 	}
 
-	// 应该创建了 markers 子目录
+	// Should have created markers subdirectory
 	if _, err := os.Stat(filepath.Join(bus.Dir, "markers")); err != nil {
-		t.Fatalf("markers 目录不存在: %v", err)
+		t.Fatalf("markers directory does not exist: %v", err)
 	}
 
-	// 应该创建了 latest 文件
+	// Should have created latest file
 	name, err := bus.latestName()
 	if err != nil {
-		t.Fatalf("读取 latest 失败: %v", err)
+		t.Fatalf("read latest failed: %v", err)
 	}
-	if name != "events.001.jsonl.gz" {
-		t.Fatalf("latest = %q, want events.001.jsonl.gz", name)
+	// Filename format: events.001-<hash>.jsonl.gz
+	if !strings.HasPrefix(name, "events.001-") || !strings.HasSuffix(name, ".jsonl.gz") {
+		t.Fatalf("latest = %q, want events.001-<hash>.jsonl.gz", name)
 	}
 
-	// 应该创建了事件文件
+	// Should have created event file
 	if _, err := os.Stat(filepath.Join(bus.Dir, name)); err != nil {
-		t.Fatalf("事件文件不存在: %v", err)
+		t.Fatalf("event file does not exist: %v", err)
 	}
 
-	// 重复 Init 应该不报错
+	// Duplicate Init should not error
 	if err := bus.Init(); err != nil {
-		t.Fatalf("重复 Init 失败: %v", err)
+		t.Fatalf("duplicate Init failed: %v", err)
 	}
 }
 
@@ -144,11 +164,11 @@ func TestBusAddSingle(t *testing.T) {
 	payload := json.RawMessage(`{"from": "alice@example.com"}`)
 	evt, err := bus.Add("email.received", "inbox", payload)
 	if err != nil {
-		t.Fatalf("Add 失败: %v", err)
+		t.Fatalf("Add failed: %v", err)
 	}
 
 	if evt.ID == "" {
-		t.Fatal("事件 ID 为空")
+		t.Fatal("event ID is empty")
 	}
 	if evt.Type != "email.received" {
 		t.Errorf("Type = %q, want email.received", evt.Type)
@@ -160,19 +180,18 @@ func TestBusAddSingle(t *testing.T) {
 		t.Errorf("Payload = %s", string(evt.Payload))
 	}
 
-	// 检查 meta 更新
-	meta, err := bus.loadMeta("events.001.jsonl.gz")
+	// Check file stats (no more meta file)
+	name, _ := bus.latestName()
+	uncompressedSize, lineCount, err := bus.getFileStats(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.LineCount != 1 {
-		t.Errorf("LineCount = %d, want 1", meta.LineCount)
+	// 1 rotate event + 1 user event = 2 total lines
+	if lineCount != 2 {
+		t.Errorf("LineCount = %d, want 2", lineCount)
 	}
-	if meta.UncompressedSize <= 0 {
-		t.Errorf("UncompressedSize = %d, want > 0", meta.UncompressedSize)
-	}
-	if meta.FirstLineHash == "" {
-		t.Error("FirstLineHash 为空")
+	if uncompressedSize <= 0 {
+		t.Errorf("UncompressedSize = %d, want > 0", uncompressedSize)
 	}
 }
 
@@ -183,45 +202,49 @@ func TestBusAddMultiple(t *testing.T) {
 		payload := json.RawMessage(fmt.Sprintf(`{"index": %d}`, i))
 		_, err := bus.Add("test.event", "test", payload)
 		if err != nil {
-			t.Fatalf("Add[%d] 失败: %v", i, err)
+			t.Fatalf("Add[%d] failed: %v", i, err)
 		}
 	}
 
-	meta, err := bus.loadMeta("events.001.jsonl.gz")
+	name, _ := bus.latestName()
+	uncompressedSize, lineCount, err := bus.getFileStats(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.LineCount != 10 {
-		t.Errorf("LineCount = %d, want 10", meta.LineCount)
+	// 1 rotate event + 10 user events = 11 total
+	if lineCount != 11 {
+		t.Errorf("LineCount = %d, want 11", lineCount)
+	}
+	if uncompressedSize <= 0 {
+		t.Errorf("UncompressedSize = %d, want > 0", uncompressedSize)
 	}
 }
 
 func TestBusListAll(t *testing.T) {
 	bus := setupTestBus(t)
 
-	// 添加 3 个事件
+	// Add 3 events
 	for i := 0; i < 3; i++ {
-		payload := json.RawMessage(`{"i": ` + strings.Repeat("x", i+1) + `}`)
-		// 修正: 使用有效 JSON
-		payload = json.RawMessage(`{"i": ` + itoa(i) + `}`)
+		payload := json.RawMessage(`{"i": ` + itoa(i) + `}`)
 		_, err := bus.Add("test", "ch1", payload)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// 不带 marker 的 channel，应列出所有
+	// Channel without marker should list all (excluding rotate events)
 	entries, err := bus.List("new-channel", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Should only see user events, not rotate events
 	if len(entries) != 3 {
 		t.Fatalf("len(entries) = %d, want 3", len(entries))
 	}
 
-	// 每个 entry 应有正确的位置
+	// Each entry should have correct position
 	for i, e := range entries {
-		if e.File != "events.001.jsonl.gz" {
+		if !strings.HasPrefix(e.File, "events.001-") {
 			t.Errorf("[%d] File = %q", i, e.File)
 		}
 		if e.Offset <= 0 {
@@ -230,12 +253,16 @@ func TestBusListAll(t *testing.T) {
 		if e.Type != "test" {
 			t.Errorf("[%d] Type = %q", i, e.Type)
 		}
+		// Should not be rotate events
+		if e.Type == RotateEventType {
+			t.Errorf("[%d] should not be rotate event", i)
+		}
 	}
 
-	// offset 应该递增
+	// offsets should be increasing
 	for i := 1; i < len(entries); i++ {
 		if entries[i].Offset <= entries[i-1].Offset {
-			t.Errorf("offset 未递增: [%d]=%d, [%d]=%d",
+			t.Errorf("offset not increasing: [%d]=%d, [%d]=%d",
 				i-1, entries[i-1].Offset, i, entries[i].Offset)
 		}
 	}
@@ -244,7 +271,7 @@ func TestBusListAll(t *testing.T) {
 func TestBusListWithMarker(t *testing.T) {
 	bus := setupTestBus(t)
 
-	// 添加 5 个事件
+	// Add 5 events
 	for i := 0; i < 5; i++ {
 		_, err := bus.Add("test", "ch1", json.RawMessage(`{"i":`+itoa(i)+`}`))
 		if err != nil {
@@ -252,7 +279,7 @@ func TestBusListWithMarker(t *testing.T) {
 		}
 	}
 
-	// 列出所有
+	// List all
 	all, err := bus.List("reader", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -261,13 +288,13 @@ func TestBusListWithMarker(t *testing.T) {
 		t.Fatalf("len(all) = %d, want 5", len(all))
 	}
 
-	// 在第 3 个事件处 mark
+	// Mark at 3rd event
 	pos := Position{File: all[2].File, Offset: all[2].Offset}
 	if err := bus.Mark("reader", pos); err != nil {
 		t.Fatal(err)
 	}
 
-	// 再列出，应只有后 2 个
+	// List again, should only have last 2
 	remaining, err := bus.List("reader", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -276,13 +303,13 @@ func TestBusListWithMarker(t *testing.T) {
 		t.Fatalf("len(remaining) = %d, want 2", len(remaining))
 	}
 
-	// mark 到最后
+	// Mark to last
 	lastPos := Position{File: remaining[1].File, Offset: remaining[1].Offset}
 	if err := bus.Mark("reader", lastPos); err != nil {
 		t.Fatal(err)
 	}
 
-	// 应该没有新事件
+	// Should have no new events
 	empty, err := bus.List("reader", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -318,47 +345,55 @@ func TestBusRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 手动设置 meta 使其接近 rotation 阈值
-	meta := &FileMeta{
-		UncompressedSize: MaxUncompressedSize - RotationHeadroom + 1, // 会超过阈值
-		LineCount:        1000,
-		FirstLineHash:    "sha256:fake",
-	}
-	if err := bus.saveMeta("events.001.jsonl.gz", meta); err != nil {
-		t.Fatal(err)
-	}
+	// Get first file name
+	firstFile, _ := bus.latestName()
 
-	// 下次 add 应触发 rotation
-	_, err := bus.Add("test", "ch1", json.RawMessage(`{"big": true}`))
+	// Write enough events to trigger rotation
+	// Each event is roughly 100-200 bytes, so we need many events
+	// But for testing, we'll directly force a rotation by calling createNewFile
+	unlock, err := bus.lock()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unlock()
 
-	// 应该创建了 events.002.jsonl.gz
+	// Force create file 002
+	_, err = bus.createNewFile(2)
+	if err != nil {
+		t.Fatalf("createNewFile failed: %v", err)
+	}
+	unlock()
+
+	// Should have created events.002-<hash>.jsonl.gz
 	name, err := bus.latestName()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "events.002.jsonl.gz" {
-		t.Fatalf("latest = %q, want events.002.jsonl.gz", name)
+	if !strings.HasPrefix(name, "events.002-") {
+		t.Fatalf("latest = %q, want events.002-<hash>.jsonl.gz", name)
 	}
 
-	// 新文件应该有 1 条记录
-	meta2, err := bus.loadMeta("events.002.jsonl.gz")
+	// New file should have 1 record (rotate event)
+	_, lineCount, err := bus.getFileStats(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta2.LineCount != 1 {
-		t.Errorf("LineCount = %d, want 1", meta2.LineCount)
+	if lineCount != 1 {
+		t.Errorf("LineCount = %d, want 1", lineCount)
 	}
 
-	// 列出所有文件
+	// List all files
 	files, err := bus.listFiles()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(files) != 2 {
 		t.Fatalf("len(files) = %d, want 2", len(files))
+	}
+
+	// Verify first file still exists
+	if files[0] != firstFile {
+		t.Errorf("first file = %q, want %q", files[0], firstFile)
 	}
 }
 
@@ -369,7 +404,7 @@ func TestBusListAcrossFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 往 file 001 写 3 个事件
+	// Write 3 events to file 001
 	for i := 0; i < 3; i++ {
 		_, err := bus.Add("batch1", "ch", json.RawMessage(`{"batch":1,"i":`+itoa(i)+`}`))
 		if err != nil {
@@ -377,12 +412,15 @@ func TestBusListAcrossFiles(t *testing.T) {
 		}
 	}
 
-	// 手动强制 rotation
-	meta, _ := bus.loadMeta("events.001.jsonl.gz")
-	meta.UncompressedSize = MaxUncompressedSize // 强制超过
-	bus.saveMeta("events.001.jsonl.gz", meta)
+	// Force rotation to file 002
+	unlock, err := bus.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus.createNewFile(2)
+	unlock()
 
-	// 再写 2 个事件（应该到 file 002）
+	// Write 2 more events (should go to file 002)
 	for i := 0; i < 2; i++ {
 		_, err := bus.Add("batch2", "ch", json.RawMessage(`{"batch":2,"i":`+itoa(i)+`}`))
 		if err != nil {
@@ -391,11 +429,11 @@ func TestBusListAcrossFiles(t *testing.T) {
 	}
 
 	latestName, _ := bus.latestName()
-	if latestName != "events.002.jsonl.gz" {
-		t.Fatalf("latest = %q, want events.002.jsonl.gz", latestName)
+	if !strings.HasPrefix(latestName, "events.002-") {
+		t.Fatalf("latest = %q, want events.002-<hash>.jsonl.gz", latestName)
 	}
 
-	// 列出所有：应有 5 个 (3 + 2)
+	// List all: should have 5 (3 + 2)
 	all, err := bus.List("reader", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -404,26 +442,26 @@ func TestBusListAcrossFiles(t *testing.T) {
 		t.Fatalf("len(all) = %d, want 5", len(all))
 	}
 
-	// 前 3 个在 file 001
+	// First 3 in file 001
 	for i := 0; i < 3; i++ {
-		if all[i].File != "events.001.jsonl.gz" {
-			t.Errorf("[%d] File = %q, want events.001.jsonl.gz", i, all[i].File)
+		if !strings.HasPrefix(all[i].File, "events.001-") {
+			t.Errorf("[%d] File = %q, want events.001-<hash>.jsonl.gz", i, all[i].File)
 		}
 	}
-	// 后 2 个在 file 002
+	// Last 2 in file 002
 	for i := 3; i < 5; i++ {
-		if all[i].File != "events.002.jsonl.gz" {
-			t.Errorf("[%d] File = %q, want events.002.jsonl.gz", i, all[i].File)
+		if !strings.HasPrefix(all[i].File, "events.002-") {
+			t.Errorf("[%d] File = %q, want events.002-<hash>.jsonl.gz", i, all[i].File)
 		}
 	}
 
-	// 在 file 001 的最后 mark
+	// Mark at end of file 001
 	pos := Position{File: all[2].File, Offset: all[2].Offset}
 	if err := bus.Mark("reader", pos); err != nil {
 		t.Fatal(err)
 	}
 
-	// 只应列出 file 002 的 2 个
+	// Should only list file 002's 2 events
 	remaining, err := bus.List("reader", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -441,16 +479,17 @@ func TestBusStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 默认 status (latest)
+	// Default status (latest)
 	st, err := bus.Status("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !st.IsLatest {
-		t.Error("应该是 latest")
+		t.Error("should be latest")
 	}
-	if st.LineCount != 1 {
-		t.Errorf("LineCount = %d, want 1", st.LineCount)
+	// 1 rotate + 1 user = 2 lines
+	if st.LineCount != 2 {
+		t.Errorf("LineCount = %d, want 2", st.LineCount)
 	}
 	if st.CompressedSize <= 0 {
 		t.Errorf("CompressedSize = %d, want > 0", st.CompressedSize)
@@ -459,19 +498,20 @@ func TestBusStatus(t *testing.T) {
 		t.Errorf("UncompressedSize = %d, want > 0", st.UncompressedSize)
 	}
 
-	// 指定文件名 status
-	st2, err := bus.Status("events.001.jsonl.gz")
+	// Status by filename
+	name, _ := bus.latestName()
+	st2, err := bus.Status(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st2.Name != "events.001.jsonl.gz" {
+	if st2.Name != name {
 		t.Errorf("Name = %q", st2.Name)
 	}
 
-	// 不存在的文件
-	_, err = bus.Status("events.999.jsonl.gz")
+	// Non-existent file
+	_, err = bus.Status("events.999-a1b2c3d4.jsonl.gz")
 	if err == nil {
-		t.Fatal("应该报错")
+		t.Fatal("should error")
 	}
 }
 
@@ -480,9 +520,9 @@ func TestBusParseSeq(t *testing.T) {
 		name string
 		want int
 	}{
-		{"events.001.jsonl.gz", 1},
-		{"events.010.jsonl.gz", 10},
-		{"events.999.jsonl.gz", 999},
+		{"events.001-a1b2c3d4.jsonl.gz", 1},
+		{"events.010-e5f6g7h8.jsonl.gz", 10},
+		{"events.999-i9j0k1l2.jsonl.gz", 999},
 	}
 
 	for _, tt := range tests {
@@ -496,18 +536,18 @@ func TestBusParseSeq(t *testing.T) {
 func TestBusMultipleChannels(t *testing.T) {
 	bus := setupTestBus(t)
 
-	// 添加事件到不同 channel
+	// Add events to different channels
 	bus.Add("a", "ch1", json.RawMessage(`{}`))
 	bus.Add("b", "ch2", json.RawMessage(`{}`))
 	bus.Add("c", "ch1", json.RawMessage(`{}`))
 
-	// ch1 应列出 3 个 (所有事件，因为 List 不按 channel 过滤内容)
+	// ch1 should list 3 (all events, List doesn't filter by channel)
 	all, _ := bus.List("ch1-reader", 0)
 	if len(all) != 3 {
 		t.Fatalf("len(all) = %d, want 3", len(all))
 	}
 
-	// 两个独立的 reader 各自 mark
+	// Two independent readers with their own marks
 	bus.Mark("reader-a", Position{File: all[0].File, Offset: all[0].Offset})
 	bus.Mark("reader-b", Position{File: all[1].File, Offset: all[1].Offset})
 
@@ -537,18 +577,84 @@ func TestBusEmptyList(t *testing.T) {
 func TestBusMarkInvalidFile(t *testing.T) {
 	bus := setupTestBus(t)
 
-	err := bus.Mark("test", Position{File: "events.999.jsonl.gz", Offset: 0})
+	err := bus.Mark("test", Position{File: "events.999-a1b2c3d4.jsonl.gz", Offset: 0})
 	if err == nil {
-		t.Fatal("应该报错: 文件不存在")
+		t.Fatal("should error: file does not exist")
+	}
+}
+
+func TestRotateEvent(t *testing.T) {
+	bus := setupTestBus(t)
+
+	// Read the raw file to verify it has a rotate event at the start
+	name, _ := bus.latestName()
+
+	// Read and decompress the file directly
+	fpath := filepath.Join(bus.Dir, name)
+	f, err := os.Open(fpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gr.Close()
+
+	// Read first line
+	scanner := bufio.NewScanner(gr)
+	if !scanner.Scan() {
+		t.Fatal("file should have at least one line")
+	}
+
+	line := scanner.Bytes()
+	var evt Event
+	if err := json.Unmarshal(line, &evt); err != nil {
+		t.Fatalf("failed to unmarshal event: %v", err)
+	}
+
+	// First entry should be rotate event
+	if evt.Type != RotateEventType {
+		t.Errorf("first event type = %q, want %s", evt.Type, RotateEventType)
+	}
+
+	// Verify payload contains UUID
+	var rotateEvt RotateEvent
+	if err := json.Unmarshal(evt.Payload, &rotateEvt); err != nil {
+		t.Fatalf("failed to unmarshal rotate event: %v", err)
+	}
+	if rotateEvt.UUID == "" {
+		t.Error("rotate event UUID is empty")
+	}
+	if len(rotateEvt.UUID) != 32 {
+		t.Errorf("UUID length = %d, want 32", len(rotateEvt.UUID))
+	}
+}
+
+func TestFilenameContainsHash(t *testing.T) {
+	bus := setupTestBus(t)
+
+	name, err := bus.latestName()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Filename format: events.001-<hash>.jsonl.gz
+	// Extract hash from filename
+	parts := strings.Split(strings.TrimPrefix(name, "events."), "-")
+	if len(parts) < 2 {
+		t.Fatalf("filename format incorrect: %s", name)
+	}
+	hashInFilename := strings.TrimSuffix(parts[1], ".jsonl.gz")
+
+	// Hash should be 8 chars
+	if len(hashInFilename) != 8 {
+		t.Errorf("hash in filename length = %d, want 8", len(hashInFilename))
 	}
 }
 
 func itoa(i int) string {
-	return strings.TrimSpace("  " + itoa2(i) + "  ")
-}
-
-func itoa2(i int) string {
-	b := make([]byte, 0, 4)
-	b = append(b, byte('0'+i%10))
-	return string(b)
+	return fmt.Sprintf("%d", i)
 }

@@ -15,40 +15,53 @@ import (
 	"time"
 )
 
-// Bus 是基于文件的 EventBus。
+// fileTracking tracks in-memory stats for the current file.
+type fileTracking struct {
+	uncompressedSize int64
+	lineCount        int64
+}
+
+// Bus is a file-based EventBus.
 type Bus struct {
-	Dir string // 事件存储目录
+	Dir string // Event storage directory
+
+	// In-memory tracking for current file (only valid during lock lifetime)
+	tracking map[string]*fileTracking
 }
 
-// NewBus 创建一个 EventBus，使用指定目录。
+// NewBus creates an EventBus using the specified directory.
 func NewBus(dir string) *Bus {
-	return &Bus{Dir: dir}
+	return &Bus{
+		Dir:      dir,
+		tracking: make(map[string]*fileTracking),
+	}
 }
 
-// DefaultBus 创建使用默认路径 (~/.emx-mail/events/) 的 EventBus。
+// DefaultBus creates an EventBus using the default path (~/.emx-mail/events/).
 func DefaultBus() (*Bus, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("获取用户目录失败: %w", err)
+		return nil, fmt.Errorf("failed to get user home directory: %w", err)
 	}
 	dir := filepath.Join(home, ".emx-mail", "events")
 	return NewBus(dir), nil
 }
 
-// Init 初始化事件目录，创建必要的子目录和首个 events 文件。
+// Init initializes the event directory, creating necessary subdirectories and the first events file.
 func (b *Bus) Init() error {
 	if err := os.MkdirAll(filepath.Join(b.Dir, "markers"), 0o755); err != nil {
-		return fmt.Errorf("创建目录失败: %w", err)
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
-	// 如果还没有 latest，创建第一个文件
+	// If there's no latest file yet, create the first file
 	_, err := b.latestName()
 	if err != nil {
-		return b.createNewFile(1)
+		_, err = b.createNewFile(1)
+		return err
 	}
 	return nil
 }
 
-// Add 向 EventBus 添加一个事件。独占锁保护。
+// Add adds an event to the EventBus. Protected by exclusive lock.
 func (b *Bus) Add(typ, channel string, payload json.RawMessage) (*Event, error) {
 	unlock, err := b.lock()
 	if err != nil {
@@ -70,69 +83,54 @@ func (b *Bus) Add(typ, channel string, payload json.RawMessage) (*Event, error) 
 
 	line, err := json.Marshal(evt)
 	if err != nil {
-		return nil, fmt.Errorf("序列化事件失败: %w", err)
+		return nil, fmt.Errorf("failed to serialize event: %w", err)
 	}
 	line = append(line, '\n')
 
-	// 检查是否需要 rotation
+	// Check if rotation is needed
 	latestFile, err := b.latestName()
 	if err != nil {
 		return nil, err
 	}
 
-	meta, err := b.loadMeta(latestFile)
-	if err != nil {
-		return nil, err
-	}
-
-	if meta.UncompressedSize+int64(len(line))+RotationHeadroom >= MaxUncompressedSize {
-		// 需要 rotate
+	tracking := b.getTracking(latestFile)
+	if tracking.uncompressedSize+int64(len(line))+RotationHeadroom >= MaxUncompressedSize {
+		// Need to rotate
 		seq := parseSeq(latestFile)
-		if err := b.createNewFile(seq + 1); err != nil {
-			return nil, fmt.Errorf("rotation 失败: %w", err)
-		}
-		latestFile, err = b.latestName()
+		newFile, err := b.createNewFile(seq + 1)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("rotation failed: %w", err)
 		}
-		meta, err = b.loadMeta(latestFile)
-		if err != nil {
-			return nil, err
-		}
+		latestFile = newFile
+		tracking = b.getTracking(latestFile)
 	}
 
-	// 追加事件到 gzip 文件 (拼接新的 gzip member)
+	// Append event to gzip file (concatenate new gzip member)
 	fpath := filepath.Join(b.Dir, latestFile)
 	f, err := os.OpenFile(fpath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("打开事件文件失败: %w", err)
+		return nil, fmt.Errorf("failed to open event file: %w", err)
 	}
 	defer f.Close()
 
 	gw := gzip.NewWriter(f)
 	if _, err := gw.Write(line); err != nil {
-		return nil, fmt.Errorf("写入事件失败: %w", err)
+		return nil, fmt.Errorf("failed to write event: %w", err)
 	}
 	if err := gw.Close(); err != nil {
-		return nil, fmt.Errorf("关闭 gzip writer 失败: %w", err)
+		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
 	}
 
-	// 更新 meta
-	if meta.LineCount == 0 {
-		meta.FirstLineHash = hashLine(line)
-	}
-	meta.UncompressedSize += int64(len(line))
-	meta.LineCount++
-	if err := b.saveMeta(latestFile, meta); err != nil {
-		return nil, err
-	}
+	// Update tracking
+	tracking.uncompressedSize += int64(len(line))
+	tracking.lineCount++
 
 	return evt, nil
 }
 
-// List 列出指定 channel 从 marker 位置开始的新事件。
-// 如果 channel 没有 marker，从最早的文件开始。
-// limit <= 0 表示不限制。
+// List lists new events from the specified channel starting from the marker position.
+// If the channel has no marker, starts from the earliest file.
+// limit <= 0 means no limit.
 func (b *Bus) List(channel string, limit int) ([]EventEntry, error) {
 	unlock, err := b.lock()
 	if err != nil {
@@ -164,7 +162,7 @@ func (b *Bus) List(channel string, limit int) ([]EventEntry, error) {
 		startOffset = 0
 	}
 
-	// 找到起始文件索引
+	// Find starting file index
 	startIdx := 0
 	for i, f := range files {
 		if f == startFile {
@@ -183,7 +181,7 @@ func (b *Bus) List(channel string, limit int) ([]EventEntry, error) {
 
 		events, err := b.readFile(f, offset)
 		if err != nil {
-			return nil, fmt.Errorf("读取 %s 失败: %w", f, err)
+			return nil, fmt.Errorf("failed to read %s: %w", f, err)
 		}
 		entries = append(entries, events...)
 		if limit > 0 && len(entries) >= limit {
@@ -195,7 +193,7 @@ func (b *Bus) List(channel string, limit int) ([]EventEntry, error) {
 	return entries, nil
 }
 
-// Mark 更新 channel 的消费位置。
+// Mark updates the consumption position for a channel.
 func (b *Bus) Mark(channel string, pos Position) error {
 	unlock, err := b.lock()
 	if err != nil {
@@ -203,45 +201,39 @@ func (b *Bus) Mark(channel string, pos Position) error {
 	}
 	defer unlock()
 
-	// 验证文件存在
+	// Verify file exists
 	fpath := filepath.Join(b.Dir, pos.File)
 	if _, err := os.Stat(fpath); err != nil {
-		return fmt.Errorf("事件文件 %s 不存在: %w", pos.File, err)
-	}
-
-	// 获取首行 hash
-	meta, err := b.loadMeta(pos.File)
-	if err != nil {
-		return fmt.Errorf("读取元数据失败: %w", err)
+		return fmt.Errorf("event file %s does not exist: %w", pos.File, err)
 	}
 
 	m := &Marker{
-		File:          pos.File,
-		FirstLineHash: meta.FirstLineHash,
-		Offset:        pos.Offset,
-		UpdatedAt:     time.Now().UTC(),
+		File:      pos.File,
+		Offset:    pos.Offset,
+		UpdatedAt: time.Now().UTC(),
 	}
 
 	return b.SaveMarker(channel, m)
 }
 
-// Status 返回指定文件的状态，name 为空表示 latest。
+// Status returns the status of the specified file, empty name means latest.
 func (b *Bus) Status(name string) (*FileStatus, error) {
 	if name == "" {
 		var err error
 		name, err = b.latestName()
 		if err != nil {
-			return nil, fmt.Errorf("无活跃事件文件: %w", err)
+			return nil, fmt.Errorf("no active event file: %w", err)
 		}
 	}
 
 	fpath := filepath.Join(b.Dir, name)
 	fi, err := os.Stat(fpath)
 	if err != nil {
-		return nil, fmt.Errorf("文件 %s 不存在: %w", name, err)
+		return nil, fmt.Errorf("file %s does not exist: %w", name, err)
 	}
 
-	meta, err := b.loadMeta(name)
+	// Read file to get uncompressed size and line count
+	uncompressedSize, lineCount, err := b.getFileStats(name)
 	if err != nil {
 		return nil, err
 	}
@@ -251,28 +243,35 @@ func (b *Bus) Status(name string) (*FileStatus, error) {
 	return &FileStatus{
 		Name:             name,
 		CompressedSize:   fi.Size(),
-		UncompressedSize: meta.UncompressedSize,
-		LineCount:        meta.LineCount,
-		FirstLineHash:    meta.FirstLineHash,
+		UncompressedSize: uncompressedSize,
+		LineCount:        lineCount,
 		IsLatest:         name == latestName,
 	}, nil
 }
 
-// ListFiles 返回所有事件文件名（按序号排列）。
+// ListFiles returns all event file names (in sequence order).
 func (b *Bus) ListFiles() ([]string, error) {
 	return b.listFiles()
 }
 
-// --- 内部方法 ---
+// --- Internal methods ---
 
-// lock 获取独占锁。返回 unlock 函数。
+// getTracking returns the tracking info for a file, creating it if needed.
+func (b *Bus) getTracking(file string) *fileTracking {
+	if b.tracking[file] == nil {
+		b.tracking[file] = &fileTracking{}
+	}
+	return b.tracking[file]
+}
+
+// lock acquires an exclusive lock. Returns an unlock function.
 func (b *Bus) lock() (func(), error) {
 	lockPath := filepath.Join(b.Dir, "events.lock")
 	if err := os.MkdirAll(b.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建目录失败: %w", err)
+		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// 尝试独占创建锁文件，带重试
+	// Try to exclusively create lock file, with retry
 	var f *os.File
 	var err error
 	for attempts := 0; attempts < 50; attempts++ {
@@ -281,7 +280,7 @@ func (b *Bus) lock() (func(), error) {
 			break
 		}
 		if os.IsExist(err) {
-			// 检查锁文件是否过期 (超过 30 秒视为过期)
+			// Check if lock file is stale (older than 30 seconds is considered stale)
 			if fi, serr := os.Stat(lockPath); serr == nil {
 				if time.Since(fi.ModTime()) > 30*time.Second {
 					os.Remove(lockPath)
@@ -291,19 +290,23 @@ func (b *Bus) lock() (func(), error) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		return nil, fmt.Errorf("创建锁文件失败: %w", err)
+		return nil, fmt.Errorf("failed to create lock file: %w", err)
 	}
 	if f == nil {
-		return nil, fmt.Errorf("获取锁超时: %s", lockPath)
+		return nil, fmt.Errorf("failed to acquire lock: %s", lockPath)
 	}
 	f.Close()
 
+	// Clear tracking on lock acquisition
+	b.tracking = make(map[string]*fileTracking)
+
 	return func() {
 		os.Remove(lockPath)
+		b.tracking = make(map[string]*fileTracking)
 	}, nil
 }
 
-// latestName 读取 latest 文件，返回当前活跃的 events 文件名。
+// latestName reads the latest file and returns the currently active events file name.
 func (b *Bus) latestName() (string, error) {
 	data, err := os.ReadFile(filepath.Join(b.Dir, "latest"))
 	if err != nil {
@@ -312,33 +315,65 @@ func (b *Bus) latestName() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// setLatest 更新 latest 文件。
+// setLatest updates the latest file.
 func (b *Bus) setLatest(name string) error {
 	return os.WriteFile(filepath.Join(b.Dir, "latest"), []byte(name+"\n"), 0o644)
 }
 
-// createNewFile 创建新的 events 文件并更新 latest。
-func (b *Bus) createNewFile(seq int) error {
-	name := fmt.Sprintf("events.%03d.jsonl.gz", seq)
+// createNewFile creates a new events file with a rotate event and updates latest.
+// Returns the created filename.
+func (b *Bus) createNewFile(seq int) (string, error) {
+	// Create rotate event
+	uuid := generateUUID()
+	rotateEvt := &Event{
+		ID:        generateID(),
+		Timestamp: time.Now().UTC(),
+		Type:      RotateEventType,
+		Channel:   "",
+	}
+	rotatePayload, _ := json.Marshal(RotateEvent{UUID: uuid})
+	rotateEvt.Payload = rotatePayload
+
+	rotateLine, err := json.Marshal(rotateEvt)
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize rotate event: %w", err)
+	}
+	rotateLine = append(rotateLine, '\n')
+
+	// Calculate hash of rotate line for filename
+	hash := hashLine(rotateLine)
+	name := fmt.Sprintf("events.%03d-%s.jsonl.gz", seq, hash)
 	fpath := filepath.Join(b.Dir, name)
 
-	// 创建空的 gzip 文件
+	// Create gzip file with rotate event
 	f, err := os.Create(fpath)
 	if err != nil {
-		return fmt.Errorf("创建事件文件失败: %w", err)
+		return "", fmt.Errorf("failed to create event file: %w", err)
 	}
-	f.Close()
+	defer f.Close()
 
-	// 创建空 meta
-	meta := &FileMeta{}
-	if err := b.saveMeta(name, meta); err != nil {
-		return err
+	gw := gzip.NewWriter(f)
+	if _, err := gw.Write(rotateLine); err != nil {
+		return "", fmt.Errorf("failed to write rotate event: %w", err)
+	}
+	if err := gw.Close(); err != nil {
+		return "", fmt.Errorf("failed to close gzip writer: %w", err)
 	}
 
-	return b.setLatest(name)
+	// Initialize tracking for this file
+	b.tracking[name] = &fileTracking{
+		uncompressedSize: int64(len(rotateLine)),
+		lineCount:        1,
+	}
+
+	if err := b.setLatest(name); err != nil {
+		return "", err
+	}
+
+	return name, nil
 }
 
-// listFiles 列出所有 events.NNN.jsonl.gz 文件，按序号排序。
+// listFiles lists all events.NNN-*.jsonl.gz files, sorted by sequence number.
 func (b *Bus) listFiles() ([]string, error) {
 	entries, err := os.ReadDir(b.Dir)
 	if err != nil {
@@ -362,47 +397,62 @@ func (b *Bus) listFiles() ([]string, error) {
 	return files, nil
 }
 
-// parseSeq 从文件名提取序号。
+// parseSeq extracts the sequence number from a file name.
 func parseSeq(name string) int {
-	// events.001.jsonl.gz → 1
+	// events.001-a1b2c3d4.jsonl.gz → 1
 	name = strings.TrimPrefix(name, "events.")
+	idx := strings.Index(name, "-")
+	if idx > 0 {
+		name = name[:idx]
+	}
 	name = strings.TrimSuffix(name, ".jsonl.gz")
 	n, _ := strconv.Atoi(name)
 	return n
 }
 
-// metaPath 返回 meta 文件路径。
-func (b *Bus) metaPath(eventsFile string) string {
-	base := strings.TrimSuffix(eventsFile, ".jsonl.gz")
-	return filepath.Join(b.Dir, base+".meta.json")
-}
-
-// loadMeta 加载 meta 文件。
-func (b *Bus) loadMeta(eventsFile string) (*FileMeta, error) {
-	data, err := os.ReadFile(b.metaPath(eventsFile))
+// getFileStats calculates uncompressed size and line count by reading the file.
+func (b *Bus) getFileStats(name string) (int64, int64, error) {
+	fpath := filepath.Join(b.Dir, name)
+	f, err := os.Open(fpath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &FileMeta{}, nil
+		return 0, 0, err
+	}
+	defer f.Close()
+
+	// Check if file is empty
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, 0, err
+	}
+	if fi.Size() == 0 {
+		return 0, 0, nil
+	}
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to open gzip: %w", err)
+	}
+	defer gr.Close()
+
+	gr.Multistream(true)
+
+	data, err := io.ReadAll(gr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to decompress: %w", err)
+	}
+
+	lineCount := int64(0)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) > 0 {
+			lineCount++
 		}
-		return nil, fmt.Errorf("读取 meta 失败: %w", err)
 	}
-	var meta FileMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, fmt.Errorf("解析 meta 失败: %w", err)
-	}
-	return &meta, nil
+
+	return int64(len(data)), lineCount, scanner.Err()
 }
 
-// saveMeta 保存 meta 文件。
-func (b *Bus) saveMeta(eventsFile string, meta *FileMeta) error {
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return fmt.Errorf("序列化 meta 失败: %w", err)
-	}
-	return os.WriteFile(b.metaPath(eventsFile), data, 0o644)
-}
-
-// readFile 从 gzip 文件中读取事件，从指定的未压缩字节偏移量开始。
+// readFile reads events from a gzip file, starting from the specified uncompressed byte offset.
 func (b *Bus) readFile(name string, fromOffset int64) ([]EventEntry, error) {
 	fpath := filepath.Join(b.Dir, name)
 	f, err := os.Open(fpath)
@@ -411,7 +461,7 @@ func (b *Bus) readFile(name string, fromOffset int64) ([]EventEntry, error) {
 	}
 	defer f.Close()
 
-	// 检查文件是否为空
+	// Check if file is empty
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -422,27 +472,27 @@ func (b *Bus) readFile(name string, fromOffset int64) ([]EventEntry, error) {
 
 	gr, err := gzip.NewReader(f)
 	if err != nil {
-		return nil, fmt.Errorf("打开 gzip 失败: %w", err)
+		return nil, fmt.Errorf("failed to open gzip: %w", err)
 	}
 	defer gr.Close()
 
-	// gzip.Reader 的 Multistream(true) 是默认行为，会读取所有拼接的 gzip 成员
+	// gzip.Reader's Multistream(true) is the default behavior, reads all concatenated gzip members
 	gr.Multistream(true)
 
-	// 读取全部未压缩内容
+	// Read all uncompressed content
 	data, err := io.ReadAll(gr)
 	if err != nil {
-		return nil, fmt.Errorf("解压失败: %w", err)
+		return nil, fmt.Errorf("failed to decompress: %w", err)
 	}
 
 	if int64(len(data)) <= fromOffset {
 		return nil, nil
 	}
 
-	// 从 offset 处开始按行读取
+	// Read line by line starting from offset
 	remaining := data[fromOffset:]
 	scanner := bufio.NewScanner(bytes.NewReader(remaining))
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // 最大 10MB 单行
+	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // Max 10MB single line
 
 	var entries []EventEntry
 	currentOffset := fromOffset
@@ -460,7 +510,13 @@ func (b *Bus) readFile(name string, fromOffset int64) ([]EventEntry, error) {
 		var evt Event
 		if err := json.Unmarshal(line, &evt); err != nil {
 			currentOffset = endOffset
-			continue // 跳过无法解析的行
+			continue // Skip unparseable lines
+		}
+
+		// Skip rotate events when listing
+		if evt.Type == RotateEventType {
+			currentOffset = endOffset
+			continue
 		}
 
 		entries = append(entries, EventEntry{

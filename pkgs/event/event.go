@@ -1,20 +1,21 @@
-// Package event 实现基于文件的 EventBus。
+// Package event implements a file-based EventBus.
 //
-// 事件以 JSONL 格式存储在 gzip 压缩文件中，支持 rotation、多 channel marker 消费。
-// 存储目录默认为 ~/.emx-mail/events/。
+// Events are stored in JSONL format in gzip-compressed files, supporting rotation and multi-channel marker-based consumption.
+// Default storage directory is ~/.emx-mail/events/.
 //
-// 目录结构:
+// Directory structure:
 //
 //	~/.emx-mail/events/
-//	├── events.001.jsonl.gz       # 已归档
-//	├── events.001.meta.json      # 元数据 (未压缩大小、首行hash)
-//	├── events.002.jsonl.gz       # 当前活跃文件
-//	├── events.002.meta.json
-//	├── latest                    # 文本文件，内容为当前活跃文件名
-//	├── events.lock               # 独占锁文件 (临时)
+//	├── events.001-a1b2c3d4.jsonl.gz       # Currently active file
+//	├── events.002-e5f6g7h8.jsonl.gz       # Archived
+//	├── latest                             # Text file containing the active file name
+//	├── events.lock                        # Exclusive lock file (temporary)
 //	└── markers/
-//	    ├── my-channel.json       # channel marker
+//	    ├── my-channel.json               # channel marker
 //	    └── other-channel.json
+//
+// Each events file starts with a "rotate" event containing a UUID, and the filename includes
+// the hash of this rotate event line for identity verification.
 package event
 
 import (
@@ -28,14 +29,22 @@ import (
 	"time"
 )
 
-// MaxUncompressedSize 是单个 events 文件未压缩数据的最大大小。
-// 当 (当前未压缩大小 + 新事件大小 + 64KB) >= 64MB 时触发 rotation。
+// MaxUncompressedSize is the maximum uncompressed size for a single events file.
+// Rotation is triggered when (current uncompressed size + new event size + 64KB) >= 64MB.
 const MaxUncompressedSize = 64 * 1024 * 1024 // 64 MB
 
-// RotationHeadroom 是 rotation 判断时的预留空间。
+// RotationHeadroom is the reserved space for rotation judgment.
 const RotationHeadroom = 64 * 1024 // 64 KB
 
-// Event 是 EventBus 中的一个事件。
+// RotateEventType is the event type for rotation marker events.
+const RotateEventType = "__rotate__"
+
+// RotateEvent is the first event in each events file, containing a UUID for file identity.
+type RotateEvent struct {
+	UUID string `json:"uuid"`
+}
+
+// Event is an event in the EventBus.
 type Event struct {
 	ID        string          `json:"id"`
 	Timestamp time.Time       `json:"timestamp"`
@@ -44,55 +53,47 @@ type Event struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// EventEntry 是从文件中读取的事件，附带位置信息。
+// EventEntry is an event read from a file with positional information.
 type EventEntry struct {
 	Event
-	File   string `json:"file"`   // 事件所在文件名
-	Offset int64  `json:"offset"` // 该事件之后的字节偏移量 (未压缩流中的行尾位置)
+	File   string `json:"file"`   // Event file name
+	Offset int64  `json:"offset"` // Byte offset after this event (in uncompressed stream at line end)
 }
 
-// FileMeta 是 events 文件的元数据，存储在 .meta.json 中。
-type FileMeta struct {
-	UncompressedSize int64  `json:"uncompressed_size"`
-	LineCount        int64  `json:"line_count"`
-	FirstLineHash    string `json:"first_line_hash"` // "sha256:<hex>"
-}
-
-// Position 表示一个消费位置，用于 mark 命令。
-type Position struct {
-	File   string `json:"file"`
-	Offset int64  `json:"offset"`
-}
-
-// String 返回 "file:offset" 格式的位置字符串。
-func (p Position) String() string {
-	return fmt.Sprintf("%s:%d", p.File, p.Offset)
-}
-
-// ParsePosition 从 "file:offset" 格式字符串解析 Position。
-func ParsePosition(s string) (Position, error) {
-	idx := strings.LastIndex(s, ":")
-	if idx <= 0 || idx >= len(s)-1 {
-		return Position{}, fmt.Errorf("无效的位置格式 %q，应为 file:offset", s)
-	}
-	offset, err := strconv.ParseInt(s[idx+1:], 10, 64)
-	if err != nil {
-		return Position{}, fmt.Errorf("无效的位置格式 %q，offset 不是数字: %w", s, err)
-	}
-	return Position{File: s[:idx], Offset: offset}, nil
-}
-
-// FileStatus 是单个 events 文件的状态信息。
+// FileStatus is status information for a single events file.
 type FileStatus struct {
 	Name             string `json:"name"`
 	CompressedSize   int64  `json:"compressed_size"`
 	UncompressedSize int64  `json:"uncompressed_size"`
 	LineCount        int64  `json:"line_count"`
-	FirstLineHash    string `json:"first_line_hash"`
 	IsLatest         bool   `json:"is_latest"`
 }
 
-// generateID 生成事件 ID：时间戳 + 随机后缀。
+// Position represents a consumption position for mark commands.
+type Position struct {
+	File   string `json:"file"`
+	Offset int64  `json:"offset"`
+}
+
+// String returns a position string in "file:offset" format.
+func (p Position) String() string {
+	return fmt.Sprintf("%s:%d", p.File, p.Offset)
+}
+
+// ParsePosition parses a Position from "file:offset" format string.
+func ParsePosition(s string) (Position, error) {
+	idx := strings.LastIndex(s, ":")
+	if idx <= 0 || idx >= len(s)-1 {
+		return Position{}, fmt.Errorf("invalid position format %q, expected file:offset", s)
+	}
+	offset, err := strconv.ParseInt(s[idx+1:], 10, 64)
+	if err != nil {
+		return Position{}, fmt.Errorf("invalid position format %q, offset is not a number: %w", s, err)
+	}
+	return Position{File: s[:idx], Offset: offset}, nil
+}
+
+// generateID generates an event ID: timestamp + random suffix.
 func generateID() string {
 	ts := time.Now().UTC().Format("20060102T150405")
 	b := make([]byte, 4)
@@ -100,8 +101,15 @@ func generateID() string {
 	return ts + "-" + hex.EncodeToString(b)
 }
 
-// hashLine 计算一行数据的 SHA-256 哈希。
+// generateUUID generates a random UUID for file rotation.
+func generateUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// hashLine calculates the SHA-256 hash of a line, returning first 8 chars.
 func hashLine(data []byte) string {
 	h := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(h[:])
+	return hex.EncodeToString(h[:])[:8]
 }

@@ -1,8 +1,10 @@
 package event
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -10,27 +12,26 @@ import (
 func TestMarkerSaveLoad(t *testing.T) {
 	bus := setupTestBus(t)
 
+	// Get the actual filename created by the bus
+	actualFile, _ := bus.latestName()
+
 	m := &Marker{
-		File:          "events.001.jsonl.gz",
-		FirstLineHash: "sha256:abc123",
-		Offset:        2048,
-		UpdatedAt:     time.Now().UTC().Truncate(time.Second),
+		File:      actualFile,
+		Offset:    2048,
+		UpdatedAt: time.Now().UTC().Truncate(time.Second),
 	}
 
 	if err := bus.SaveMarker("my-channel", m); err != nil {
-		t.Fatalf("SaveMarker 失败: %v", err)
+		t.Fatalf("SaveMarker failed: %v", err)
 	}
 
 	loaded, err := bus.LoadMarker("my-channel")
 	if err != nil {
-		t.Fatalf("LoadMarker 失败: %v", err)
+		t.Fatalf("LoadMarker failed: %v", err)
 	}
 
 	if loaded.File != m.File {
 		t.Errorf("File = %q, want %q", loaded.File, m.File)
-	}
-	if loaded.FirstLineHash != m.FirstLineHash {
-		t.Errorf("FirstLineHash = %q, want %q", loaded.FirstLineHash, m.FirstLineHash)
 	}
 	if loaded.Offset != m.Offset {
 		t.Errorf("Offset = %d, want %d", loaded.Offset, m.Offset)
@@ -42,17 +43,19 @@ func TestMarkerLoadNotExist(t *testing.T) {
 
 	_, err := bus.LoadMarker("nonexistent")
 	if !os.IsNotExist(err) {
-		t.Fatalf("应返回 os.IsNotExist 错误, got: %v", err)
+		t.Fatalf("should return os.IsNotExist error, got: %v", err)
 	}
 }
 
 func TestMarkerOverwrite(t *testing.T) {
 	bus := setupTestBus(t)
 
-	m1 := &Marker{File: "events.001.jsonl.gz", Offset: 100, UpdatedAt: time.Now().UTC()}
+	actualFile, _ := bus.latestName()
+
+	m1 := &Marker{File: actualFile, Offset: 100, UpdatedAt: time.Now().UTC()}
 	bus.SaveMarker("ch", m1)
 
-	m2 := &Marker{File: "events.001.jsonl.gz", Offset: 200, UpdatedAt: time.Now().UTC()}
+	m2 := &Marker{File: actualFile, Offset: 200, UpdatedAt: time.Now().UTC()}
 	bus.SaveMarker("ch", m2)
 
 	loaded, _ := bus.LoadMarker("ch")
@@ -64,7 +67,9 @@ func TestMarkerOverwrite(t *testing.T) {
 func TestListChannels(t *testing.T) {
 	bus := setupTestBus(t)
 
-	// 空列表
+	actualFile, _ := bus.latestName()
+
+	// Empty list
 	channels, err := bus.ListChannels()
 	if err != nil {
 		t.Fatal(err)
@@ -73,8 +78,8 @@ func TestListChannels(t *testing.T) {
 		t.Fatalf("len = %d, want 0", len(channels))
 	}
 
-	// 添加 marker
-	m := &Marker{File: "events.001.jsonl.gz", Offset: 0, UpdatedAt: time.Now().UTC()}
+	// Add markers
+	m := &Marker{File: actualFile, Offset: 0, UpdatedAt: time.Now().UTC()}
 	bus.SaveMarker("alpha", m)
 	bus.SaveMarker("beta", m)
 	bus.SaveMarker("gamma", m)
@@ -87,14 +92,14 @@ func TestListChannels(t *testing.T) {
 		t.Fatalf("len = %d, want 3", len(channels))
 	}
 
-	// 应该包含所有 channel
+	// Should contain all channels
 	found := map[string]bool{}
 	for _, ch := range channels {
 		found[ch] = true
 	}
 	for _, want := range []string{"alpha", "beta", "gamma"} {
 		if !found[want] {
-			t.Errorf("缺少 channel: %s", want)
+			t.Errorf("missing channel: %s", want)
 		}
 	}
 }
@@ -119,44 +124,71 @@ func TestSanitizeChannel(t *testing.T) {
 	}
 }
 
-func TestValidateMarker(t *testing.T) {
-	bus := setupTestBus(t)
-
-	// 写入一个事件使 meta 有 firstLineHash
-	bus.Add("test", "ch", []byte(`{}`))
-
-	meta, _ := bus.loadMeta("events.001.jsonl.gz")
-
-	// 有效 marker
-	m := &Marker{
-		File:          "events.001.jsonl.gz",
-		FirstLineHash: meta.FirstLineHash,
-		Offset:        0,
-	}
-	if err := bus.ValidateMarker(m); err != nil {
-		t.Fatalf("ValidateMarker 应通过: %v", err)
-	}
-
-	// hash 不匹配
-	m.FirstLineHash = "sha256:wrong"
-	if err := bus.ValidateMarker(m); err == nil {
-		t.Fatal("hash 不匹配应报错")
-	}
-
-	// 文件不存在
-	m.File = "events.999.jsonl.gz"
-	if err := bus.ValidateMarker(m); err == nil {
-		t.Fatal("文件不存在应报错")
-	}
-}
-
 func TestMarkerPathSafety(t *testing.T) {
 	bus := setupTestBus(t)
 
 	path := bus.markerPath("../../etc/passwd")
-	// 应该被 sanitize 到 markers 目录下
+	// Should be sanitized to markers directory
 	dir := filepath.Dir(path)
 	if filepath.Base(dir) != "markers" {
-		t.Errorf("marker 应在 markers/ 下, got: %s", path)
+		t.Errorf("marker should be under markers/, got: %s", path)
+	}
+}
+
+func TestMarkerWithRotateEvent(t *testing.T) {
+	bus := setupTestBus(t)
+
+	// Add a user event
+	bus.Add("test", "ch", json.RawMessage(`{}`))
+
+	// Get the latest file name (contains hash)
+	name, err := bus.latestName()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify filename format: events.NNN-<hash>.jsonl.gz
+	if !strings.HasPrefix(name, "events.001-") || !strings.HasSuffix(name, ".jsonl.gz") {
+		t.Fatalf("filename format incorrect: %s", name)
+	}
+
+	// Create a marker at position after the user event
+	entries, err := bus.List("reader", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("should have at least one event")
+	}
+
+	// Mark at the end of the first event
+	pos := Position{File: entries[0].File, Offset: entries[0].Offset}
+	if err := bus.Mark("reader", pos); err != nil {
+		t.Fatalf("Mark failed: %v", err)
+	}
+
+	// Load marker and verify
+	loaded, err := bus.LoadMarker("reader")
+	if err != nil {
+		t.Fatalf("LoadMarker failed: %v", err)
+	}
+	if loaded.File != entries[0].File {
+		t.Errorf("File = %q, want %q", loaded.File, entries[0].File)
+	}
+	if loaded.Offset != entries[0].Offset {
+		t.Errorf("Offset = %d, want %d", loaded.Offset, entries[0].Offset)
+	}
+
+	// Verify marker doesn't contain FirstLineHash
+	data, err := os.ReadFile(bus.markerPath("reader"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var markerMap map[string]interface{}
+	if err := json.Unmarshal(data, &markerMap); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := markerMap["first_line_hash"]; exists {
+		t.Error("marker should not contain first_line_hash field")
 	}
 }
