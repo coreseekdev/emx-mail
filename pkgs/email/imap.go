@@ -37,6 +37,11 @@ func NewIMAPClient(config IMAPConfig) *IMAPClient {
 func (c *IMAPClient) Connect() error {
 	addr := fmt.Sprintf("%s:%d", c.config.Host, c.config.Port)
 
+	// Warn if connecting without TLS
+	if !c.config.SSL && !c.config.StartTLS {
+		fmt.Fprintf(os.Stderr, "WARNING: connecting to IMAP server without TLS, credentials will be sent in cleartext\n")
+	}
+
 	var client *imapclient.Client
 	var err error
 

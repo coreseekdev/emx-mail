@@ -41,6 +41,11 @@ func NewSMTPClient(config SMTPConfig) *SMTPClient {
 
 // Connect establishes a connection to the SMTP server
 func (c *SMTPClient) Connect() error {
+	// Warn if connecting without TLS
+	if !c.config.SSL && !c.config.StartTLS {
+		fmt.Fprintf(os.Stderr, "WARNING: connecting to SMTP server without TLS, credentials will be sent in cleartext\n")
+	}
+
 	var dialFn func(addr string, tlsConfig *tls.Config) (*smtp.Client, error)
 
 	tlsCfg := &tls.Config{ServerName: c.config.Host}

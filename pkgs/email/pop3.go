@@ -356,6 +356,8 @@ func (c *pop3Conn) readOne() ([]byte, error) {
 	return parsePOP3Resp(b)
 }
 
+const maxPOP3ResponseSize = 100 << 20 // 100MB maximum POP3 response size
+
 // readAll reads lines until the POP3 multiline terminator ".".
 func (c *pop3Conn) readAll() (*bytes.Buffer, error) {
 	buf := &bytes.Buffer{}
@@ -373,6 +375,11 @@ func (c *pop3Conn) readAll() (*bytes.Buffer, error) {
 		}
 		buf.Write(b)
 		buf.Write(pop3LineBreak)
+
+		// Check response size limit to prevent OOM on malicious server
+		if buf.Len() > maxPOP3ResponseSize {
+			return nil, fmt.Errorf("POP3 response exceeds maximum size (%d bytes)", maxPOP3ResponseSize)
+		}
 	}
 	return buf, nil
 }

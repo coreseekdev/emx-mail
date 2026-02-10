@@ -14,6 +14,8 @@ import (
 
 const version = "1.0.0"
 
+const maxHeaderSize = 1 << 20 // 1MB maximum header size
+
 func main() {
 	args := os.Args[1:]
 
@@ -44,6 +46,12 @@ func main() {
 	for {
 		line, err := reader.ReadBytes('\n')
 		headerBuf = append(headerBuf, line...)
+
+		// Check header size limit to prevent OOM on malformed input
+		if len(headerBuf) > maxHeaderSize {
+			fatal("header exceeds maximum size (%d bytes)", maxHeaderSize)
+		}
+
 		if err != nil {
 			if err == io.EOF {
 				break

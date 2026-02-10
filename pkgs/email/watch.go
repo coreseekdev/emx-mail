@@ -143,9 +143,10 @@ func (c *IMAPClient) checkIDLESupport() bool {
 
 // processUnprocessed processes emails that are not yet Seen
 func (c *IMAPClient) processUnprocessed(opts WatchOptions, statusWrite func(WatchStatus)) error {
-	// Search for all emails (we'll filter by Seen flag manually)
-	// Use UIDSearch to get UIDs instead of sequence numbers
-	searchData, err := c.client.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
+	// Use SEARCH UNSEEN to directly fetch unseen emails (avoids N+1 query problem)
+	searchData, err := c.client.UIDSearch(&imap.SearchCriteria{
+		NotFlag: []imap.Flag{imap.FlagSeen},
+	}, nil).Wait()
 
 	if err != nil {
 		return fmt.Errorf("search failed: %w", err)
@@ -164,44 +165,17 @@ func (c *IMAPClient) processUnprocessed(opts WatchOptions, statusWrite func(Watc
 	statusWrite(WatchStatus{
 		Type:    "process",
 		Level:   "info",
-		Message: fmt.Sprintf("Found %d total emails", len(uids)),
-	})
-
-	// Filter out emails that are already Seen (already processed)
-	unprocessedUIDs := make([]uint32, 0, len(uids))
-	for _, uid := range uids {
-		isSeen, err := c.emailIsSeen(uint32(uid))
-		if err != nil {
-			continue // Skip if we can't check
-		}
-		if !isSeen {
-			unprocessedUIDs = append(unprocessedUIDs, uint32(uid))
-		}
-	}
-
-	if len(unprocessedUIDs) == 0 {
-		statusWrite(WatchStatus{
-			Type:    "process",
-			Level:   "info",
-			Message: "No unprocessed emails found",
-		})
-		return nil
-	}
-
-	statusWrite(WatchStatus{
-		Type:    "process",
-		Level:   "info",
-		Message: fmt.Sprintf("Processing %d unprocessed emails", len(unprocessedUIDs)),
+		Message: fmt.Sprintf("Processing %d unprocessed emails", len(uids)),
 	})
 
 	// Process each email
-	for _, uid := range unprocessedUIDs {
-		if err := c.processEmail(uid, opts, statusWrite); err != nil {
+	for _, uid := range uids {
+		if err := c.processEmail(uint32(uid), opts, statusWrite); err != nil {
 			statusWrite(WatchStatus{
 				Type:    "error",
 				Level:   "error",
 				Message: fmt.Sprintf("Failed to process UID %d: %v", uid, err),
-				UID:     uid,
+				UID:     uint32(uid),
 			})
 			// Continue with next email (sequential processing)
 			continue
@@ -359,7 +333,8 @@ func (c *IMAPClient) fetchEmailMetadata(uid uint32) (*EmailMetadata, error) {
 func convertFlags(flags []imap.Flag) []string {
 	result := make([]string, 0, len(flags))
 	for _, f := range flags {
-		result = append(result, fmt.Sprintf("\\%s", f))
+		// imap.Flag already includes the backslash prefix (e.g., "\Seen")
+		result = append(result, string(f))
 	}
 	return result
 }
@@ -421,15 +396,8 @@ func (c *IMAPClient) fetchRawEmailReader(uid uint32) (io.Reader, func(), error) 
 // Linux, ~1 MB on macOS) provides automatic back-pressure so peak memory
 // usage stays bounded regardless of email size.
 func (c *IMAPClient) runHandler(cmd string, emailReader io.Reader) (int, error) {
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		return 0, fmt.Errorf("empty handler command")
-	}
-
-	cmdExec := parts[0]
-	args := parts[1:]
-
-	cmdObj := exec.Command(cmdExec, args...)
+	// Use sh -c to wrap the command, supporting spaces and quotes in paths/args
+	cmdObj := exec.Command("sh", "-c", cmd)
 	cmdObj.Stdout = os.Stderr // Handler stdout goes to stderr
 	cmdObj.Stderr = os.Stderr
 
@@ -599,7 +567,7 @@ func (c *IMAPClient) watchIDLE(ctx context.Context, opts WatchOptions, statusWri
 				Message: fmt.Sprintf("NOOP failed: %v", err),
 			})
 			// Try to reconnect
-			if err := c.reconnect(opts, statusWrite); err != nil {
+			if err := c.reconnect(ctx, opts, statusWrite); err != nil {
 				return err
 			}
 		}
@@ -646,7 +614,7 @@ func (c *IMAPClient) watchPoll(ctx context.Context, opts WatchOptions, statusWri
 					Message: fmt.Sprintf("NOOP failed: %v", err),
 				})
 				// Try to reconnect
-				if err := c.reconnect(opts, statusWrite); err != nil {
+				if err := c.reconnect(ctx, opts, statusWrite); err != nil {
 					return err
 				}
 			}
@@ -655,7 +623,7 @@ func (c *IMAPClient) watchPoll(ctx context.Context, opts WatchOptions, statusWri
 }
 
 // reconnect attempts to reconnect with exponential backoff
-func (c *IMAPClient) reconnect(opts WatchOptions, statusWrite func(WatchStatus)) error {
+func (c *IMAPClient) reconnect(ctx context.Context, opts WatchOptions, statusWrite func(WatchStatus)) error {
 	for attempt := 0; attempt < opts.MaxRetries; attempt++ {
 		waitTime := time.Duration(1<<uint(attempt)) * time.Second
 		if waitTime > 30*time.Second {
@@ -668,7 +636,12 @@ func (c *IMAPClient) reconnect(opts WatchOptions, statusWrite func(WatchStatus))
 			Message: fmt.Sprintf("Connection lost, reconnecting in %v (attempt %d/%d)", waitTime, attempt+1, opts.MaxRetries),
 		})
 
-		time.Sleep(waitTime)
+		// Check context cancellation during backoff wait
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(waitTime):
+		}
 
 		c.Close()
 		if err := c.Connect(); err != nil {
