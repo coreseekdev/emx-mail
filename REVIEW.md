@@ -663,8 +663,333 @@ if err != nil {
 
 ---
 
-### U7. [低] `list` 输出格式不支持 JSON / 可编程消费
+### U7. [低] `list` 输出格式不支持 JSON / 可编程消费 [已修复]
 
 `handleList` 输出人类友好的格式化文本。自动化工具无法可靠解析输出。
 
 **建议**: 添加 `--json` flag 输出 JSON lines 格式，方便管道和脚本集成。
+
+---
+
+---
+
+## 七、第三轮审查 — 重构 (R8–R13)
+
+日期: 2025-07-14
+
+---
+
+### R8. [高] `processUnprocessed` N+1 查询 — 应使用 SEARCH UNSEEN
+
+**文件**: `pkgs/email/watch.go` — `processUnprocessed()` + `emailIsSeen()`
+
+当前流程:
+1. `UIDSearch(&imap.SearchCriteria{})` 获取 **全部** UID（空条件 = 所有邮件）
+2. 对每一个 UID 逐个调用 `emailIsSeen(uid)`，即 N 次 FETCH FLAGS
+
+这是经典的 N+1 查询反模式。在邮箱有数千封邮件时会产生数千次 FETCH 往返，严重影响性能，甚至可能触发服务端限流。
+
+**建议**: 直接使用 IMAP `SEARCH UNSEEN`:
+
+```go
+searchData, err := c.client.UIDSearch(&imap.SearchCriteria{
+    NotFlag: []imap.Flag{imap.FlagSeen},
+}, nil).Wait()
+```
+
+同时删除 `emailIsSeen()` 函数。整个 `processUnprocessed` 方法可简化为 ~15 行。
+
+---
+
+### R9. [高] `convertFlags` 产生双反斜杠 Bug
+
+**文件**: `pkgs/email/watch.go` — `convertFlags()`
+
+```go
+func convertFlags(flags []imap.Flag) []string {
+    for _, f := range flags {
+        result = append(result, fmt.Sprintf("\\%s", f))
+    }
+}
+```
+
+`imap.Flag` 值已经包含 `\` 前缀（如 `\Seen`），`fmt.Sprintf("\\%s", f)` 再加一个 `\`，
+导致 `EmailNotification.Flags` JSON 输出为 `["\\\\Seen"]` 而非 `["\\Seen"]`。
+
+**修复**:
+
+```go
+result = append(result, string(f))
+```
+
+---
+
+### R10. [中] `reconnect` 不接受 Context — 关机信号被阻塞
+
+**文件**: `pkgs/email/watch.go` — `reconnect()`
+
+`reconnect` 使用 `time.Sleep(waitTime)` 进行指数退避等待，
+期间 `ctx.Done()` 不会被检查。当用户发送 SIGINT/SIGTERM 时，
+必须等到当前 sleep 结束后才能响应，最坏情况下等待 30 秒。
+
+**建议**: 将 `reconnect` 签名改为接受 `ctx context.Context`，内部用 select:
+
+```go
+select {
+case <-ctx.Done():
+    return ctx.Err()
+case <-time.After(waitTime):
+}
+```
+
+---
+
+### R11. [低] `go.mod` 中 pflag 标记为 indirect 但实际直接引用
+
+**文件**: `go.mod`
+
+```
+require github.com/spf13/pflag v1.0.10 // indirect
+```
+
+pflag 在 `cmd/cli/main.go`、`cmd/b4/am.go` 等多个文件中直接 import，
+应移到主 require 块并去掉 `// indirect` 注释。
+
+**修复**: 运行 `go mod tidy` 即可自动修正。
+
+---
+
+### R12. [低] `pop3Conn.cmd()` args 使用 `interface{}` + `%v` 格式化
+
+**文件**: `pkgs/email/pop3.go` — `cmd()`
+
+```go
+func (c *pop3Conn) cmd(cmd string, isMulti bool, args ...interface{}) (*bytes.Buffer, error) {
+    parts[i] = fmt.Sprintf("%v", a)
+}
+```
+
+所有实际调用处只传 `int` 和 `string`。可改为 `args ...any` (Go 1.18+)
+并使用 `strconv.Itoa` / type switch 替代 `%v`，更明确且稍有性能优势。
+优先级低，纯风格改进。
+
+---
+
+### R13. [低] `Attachment` 与 `AttachmentPath` 命名混淆
+
+**文件**: `pkgs/email/email.go`
+
+- `Attachment` — 用于接收邮件，包含 `Data []byte`
+- `AttachmentPath` — 用于发送邮件，包含 `Path string`
+
+二者用途完全不同但命名相似，易混淆。建议重命名 `AttachmentPath` 为
+`OutgoingAttachment` 或 `FileAttachment`，或在 `SendOptions` 中直接声明为匿名结构体。
+
+---
+
+## 八、第三轮审查 — 安全 / CVE (S17–S22)
+
+---
+
+### S17. [高] SMTP / POP3 / IMAP 允许不加密发送凭据
+
+**文件**: `pkgs/email/smtp.go` L62、`pkgs/email/pop3.go` `dial()`、`pkgs/email/imap.go` L55
+
+三个协议客户端在 `SSL=false, StartTLS=false` 时均使用明文连接，
+凭据 (LOGIN / PASS / SASL PLAIN) 直接在网络上传输，可被中间人截获。
+
+这不仅是隐私风险，也与 CWE-319 (Cleartext Transmission of Sensitive Information)
+和 CWE-523 (Unprotected Transport of Credentials) 直接相关。
+
+**建议**: 至少在不加密连接时输出 **stderr 警告**:
+
+```go
+if !c.config.SSL && !c.config.StartTLS {
+    fmt.Fprintln(os.Stderr, "WARNING: connecting without TLS, credentials will be sent in cleartext")
+}
+```
+
+更进一步可添加 `--allow-insecure` flag，默认拒绝明文认证。
+
+---
+
+### S18. [高] `emx-save` Header 缓冲区无大小限制 — 潜在 OOM
+
+**文件**: `cmd/emx-save/main.go` — header 读取循环
+
+```go
+for {
+    line, err := reader.ReadBytes('\n')
+    headerBuf = append(headerBuf, line...)
+    // ... 直到遇到空行
+}
+```
+
+如果输入数据没有空行分隔符（畸形邮件或恶意输入），`headerBuf` 会无限增长至 OOM。
+
+**建议**: 添加 max header size 检查（建议 1MB）:
+
+```go
+const maxHeaderSize = 1 << 20 // 1MB
+if len(headerBuf) > maxHeaderSize {
+    fatal("header exceeds maximum size (%d bytes)", maxHeaderSize)
+}
+```
+
+---
+
+### S19. [中] POP3 `readAll()` 无响应大小限制
+
+**文件**: `pkgs/email/pop3.go` — `pop3Conn.readAll()`
+
+```go
+func (c *pop3Conn) readAll() (*bytes.Buffer, error) {
+    buf := &bytes.Buffer{}
+    for {
+        b, _, err := c.r.ReadLine()
+        // ... 没有大小检查
+        buf.Write(b)
+    }
+}
+```
+
+恶意或被入侵的 POP3 服务器可发送无限数据流（不发送 `.` 终止符），
+导致客户端内存耗尽。与 CWE-400 (Uncontrolled Resource Consumption) 相关。
+
+**建议**: 添加最大响应大小限制（建议 100MB）并在超限时返回错误:
+
+```go
+const maxResponseSize = 100 << 20
+if buf.Len() > maxResponseSize {
+    return nil, fmt.Errorf("POP3 response exceeds maximum size")
+}
+```
+
+---
+
+### S20. [中] `processUnprocessed` 在大邮箱上可能造成 DoS
+
+**文件**: `pkgs/email/watch.go`
+
+与 R8 关联。当邮箱有大量邮件时，N+1 查询模式不仅慢，还会:
+1. 占用 IMAP 连接长时间无法进入 IDLE
+2. 产生大量网络流量
+3. 可能触发服务端限流/断开
+
+如果攻击者向受监控邮箱发送大量邮件，可利用此特性使 watch 进程长时间处于
+"处理中"状态而无法及时处理新邮件。
+
+**修复**: 同 R8，使用 `SEARCH UNSEEN` 并考虑添加批量大小限制。
+
+---
+
+### S21. [低] `go-imap/v2` 使用 beta 版本 (v2.0.0-beta.5)
+
+**文件**: `go.mod`
+
+Beta 版本可能包含未修复的安全漏洞且不会获得安全补丁。
+API 也可能在后续版本中发生 breaking changes。
+
+**建议**: 关注 go-imap/v2 的正式发布版本并及时升级。
+考虑设置 dependabot 或 renovate 自动跟踪依赖更新。
+
+---
+
+### S22. [低] Event Bus 锁文件 TOCTOU 竞态
+
+**文件**: `pkgs/event/bus.go` — `lock()`
+
+PID 活跃性检查存在 TOCTOU (Time-of-check to Time-of-use) 竞态:
+读取 PID → 检查进程是否存活 → 删除锁文件 — 这三步之间其他进程可能已获取/释放锁。
+
+在 CLI 工具场景下风险很低（非高并发），但如果有多个自动化脚本同时操作
+event bus，可能导致数据损坏。
+
+**建议**: 考虑使用 `flock()` (Unix) 或 `LockFileEx()` (Windows) 系统级文件锁
+替代 PID-based 方案，可使用 `golang.org/x/sys` 包。
+
+---
+
+## 九、第三轮审查 — 使用优化 (U8–U12)
+
+---
+
+### U8. [高] `list --unread-only` 应在服务端过滤
+
+**文件**: `cmd/cli/list.go` — `handleList()`
+
+当前 `--unread-only` 在客户端过滤:
+
+```go
+for _, msg := range result.Messages {
+    if f.unreadOnly && msg.Flags.Seen {
+        continue
+    }
+}
+```
+
+这意味着即使用户只想看未读邮件，也会从服务器下载全部邮件的信封。
+应在 IMAP 层使用 `SEARCH UNSEEN` + UID FETCH 仅下载未读邮件。
+
+**建议**: 在 `FetchOptions` 中添加 `UnreadOnly bool`，
+在 `IMAPClient.FetchMessages` 中根据标志使用 SEARCH UNSEEN 构建 UID 集合。
+
+---
+
+### U9. [中] Handler 命令不支持带空格路径和引号参数
+
+**文件**: `pkgs/email/watch.go` — `runHandler()`
+
+```go
+parts := strings.Fields(cmd)
+```
+
+`strings.Fields` 按空白分割，导致 `--handler "/path/to/my handler"` 或
+`--handler 'cmd --arg "with space"'` 无法正常工作。
+
+**建议**: 使用 shell 解析器（如 `github.com/kballard/go-shellquote`），
+或改为接受数组形式的 handler 参数 (`--handler-cmd <exe> --handler-arg <arg>`)。
+最简方案是用 `sh -c` / `cmd /c` 包装。
+
+---
+
+### U10. [中] `send` 命令缺少发送前确认和预览
+
+**文件**: `cmd/cli/send.go`
+
+`handleSend` 直接发送邮件，没有确认步骤。误操作（如 `--to` 写错）后果不可逆。
+
+**建议**: 添加 `--dry-run` 标志，打印待发送的邮件预览（收件人、主题、正文摘要）
+但不实际发送。可选地在非 `--dry-run` 时要求用户键入 `y` 确认。
+
+---
+
+### U11. [低] 发送时不验证邮件地址格式
+
+**文件**: `cmd/cli/util.go` — `parseAddressList()`
+
+```go
+func parseAddressList(s string) []email.Address {
+    for _, part := range parts {
+        addrs = append(addrs, email.Address{Email: part})
+    }
+}
+```
+
+不检查地址格式（如缺少 `@`、非法字符）。格式错误的地址会在 SMTP 阶段才报错，
+错误信息不够友好。
+
+**建议**: 使用 `net/mail.ParseAddress()` 或简单的 `strings.Contains(part, "@")`
+进行基本验证。
+
+---
+
+### U12. [低] POP3 `FetchMessages` 不支持 `--unread-only` 和 `--folder`
+
+**文件**: `pkgs/email/pop3.go` + `cmd/cli/list.go`
+
+POP3 协议本身不支持文件夹和已读标记，但 CLI 层未给出提示。
+当用户指定 `--protocol pop3 --folder Sent --unread-only` 时，POP3 后端忽略
+这些选项但不报 warning，用户可能误以为过滤生效。
+
+**建议**: 当 POP3 模式下使用了 IMAP 专有选项时，输出 stderr 警告。
