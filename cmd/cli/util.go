@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/mail"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -29,14 +30,30 @@ func (a *app) loadAccount() *config.AccountConfig {
 	return acc
 }
 
-// parseAddressList splits a comma-separated address string.
+// parseAddressList splits a comma-separated address string and validates each address.
 func parseAddressList(s string) []email.Address {
 	parts := strings.Split(s, ",")
 	addrs := make([]email.Address, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if part != "" {
+		if part == "" {
+			continue
+		}
+		// Validate email address format
+		// Try to parse as "Name <email>" or just "email"
+		addr, err := mail.ParseAddress(part)
+		if err != nil {
+			// If parsing fails, check if it at least contains @ (basic validation)
+			if !strings.Contains(part, "@") {
+				fmt.Fprintf(os.Stderr, "Warning: invalid email address format: %s (missing @)\n", part)
+			}
+			// Still include it - let SMTP server reject if invalid
 			addrs = append(addrs, email.Address{Email: part})
+		} else {
+			addrs = append(addrs, email.Address{
+				Name:  addr.Name,
+				Email: addr.Address,
+			})
 		}
 	}
 	return addrs

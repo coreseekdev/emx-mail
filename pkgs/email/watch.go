@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"

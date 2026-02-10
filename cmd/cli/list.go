@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -39,6 +40,11 @@ func handleList(acc *config.AccountConfig, f listFlags, verbose bool) error {
 	var result *email.ListResult
 	var err error
 
+	// Warn if using --unread-only with POP3 (not supported)
+	if f.unreadOnly && proto == "pop3" {
+		fmt.Fprintf(os.Stderr, "WARNING: --unread-only is not supported with POP3, showing all messages\n")
+	}
+
 	switch proto {
 	case "pop3":
 		client, cerr := newPOP3Client(acc)
@@ -48,6 +54,7 @@ func handleList(acc *config.AccountConfig, f listFlags, verbose bool) error {
 		result, err = client.FetchMessages(email.FetchOptions{
 			Folder: "INBOX",
 			Limit:  f.limit,
+			// POP3 doesn't support server-side filtering
 		})
 	default: // imap
 		client, cerr := newIMAPClient(acc)
@@ -55,8 +62,9 @@ func handleList(acc *config.AccountConfig, f listFlags, verbose bool) error {
 			return cerr
 		}
 		result, err = client.FetchMessages(email.FetchOptions{
-			Folder: f.folder,
-			Limit:  f.limit,
+			Folder:     f.folder,
+			Limit:      f.limit,
+			UnreadOnly: f.unreadOnly, // Server-side filtering for IMAP
 		})
 	}
 	if err != nil {
@@ -76,7 +84,9 @@ func handleList(acc *config.AccountConfig, f listFlags, verbose bool) error {
 			Flagged   bool     `json:"flagged"`
 		}
 		for _, msg := range result.Messages {
-			if f.unreadOnly && msg.Flags.Seen {
+			// Note: No need to filter here for IMAP, already done server-side
+			// But keep filter for POP3 (which doesn't support server-side filtering)
+			if f.unreadOnly && proto == "pop3" && msg.Flags.Seen {
 				continue
 			}
 			from := ""
@@ -106,11 +116,14 @@ func handleList(acc *config.AccountConfig, f listFlags, verbose bool) error {
 	fmt.Printf("Protocol: %s | Folder: %s\n", strings.ToUpper(proto), result.Folder)
 	fmt.Printf("Total: %d, Unread: %d\n\n", result.Total, result.Unread)
 
-	for i, msg := range result.Messages {
-		if f.unreadOnly && msg.Flags.Seen {
+	displayIdx := 0
+	for _, msg := range result.Messages {
+		// Note: Server-side filtering for IMAP, client-side for POP3
+		if f.unreadOnly && proto == "pop3" && msg.Flags.Seen {
 			continue
 		}
 
+		displayIdx++
 		from := "Unknown"
 		if len(msg.From) > 0 {
 			from = formatAddress(msg.From[0])
@@ -126,7 +139,7 @@ func handleList(acc *config.AccountConfig, f listFlags, verbose bool) error {
 			idLabel = "ID"
 		}
 
-		fmt.Printf("[%d] %s:%d %s From: %s\n", i+1, idLabel, msg.UID, status, from)
+		fmt.Printf("[%d] %s:%d %s From: %s\n", displayIdx, idLabel, msg.UID, status, from)
 		fmt.Printf("    Subject: %s\n", msg.Subject)
 		fmt.Printf("    Date: %s\n", msg.Date.Format(time.RFC1123))
 		fmt.Printf("    Message-ID: %s\n", msg.MessageID)

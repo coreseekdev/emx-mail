@@ -2,7 +2,9 @@ package email
 
 import (
 	"bytes"
+	"crypto/tls"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -42,13 +44,20 @@ func (c *IMAPClient) Connect() error {
 		fmt.Fprintf(os.Stderr, "WARNING: connecting to IMAP server without TLS, credentials will be sent in cleartext\n")
 	}
 
+	// Create TLS config with ServerName for proper certificate validation
+	tlsCfg := &tls.Config{ServerName: c.config.Host}
+
 	var client *imapclient.Client
 	var err error
 
 	if c.config.SSL {
-		client, err = imapclient.DialTLS(addr, &imapclient.Options{})
+		client, err = imapclient.DialTLS(addr, &imapclient.Options{
+			TLSConfig: tlsCfg,
+		})
 	} else if c.config.StartTLS {
-		client, err = imapclient.DialStartTLS(addr, &imapclient.Options{})
+		client, err = imapclient.DialStartTLS(addr, &imapclient.Options{
+			TLSConfig: tlsCfg,
+		})
 	} else {
 		client, err = imapclient.DialInsecure(addr, &imapclient.Options{})
 	}
@@ -148,27 +157,79 @@ func (c *IMAPClient) FetchMessages(opts FetchOptions) (*ListResult, error) {
 		unread = int(*statusData.NumUnseen)
 	}
 
-	// Calculate the range of sequence numbers to fetch
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	start := uint32(1)
-	if numMessages > uint32(limit) {
-		start = numMessages - uint32(limit) + 1
+	// If UnreadOnly is true, use SEARCH UNSEEN to get unread UIDs
+	var uidSet imap.UIDSet
+	if opts.UnreadOnly {
+		searchData, err := c.client.UIDSearch(&imap.SearchCriteria{
+			NotFlag: []imap.Flag{imap.FlagSeen},
+		}, nil).Wait()
+		if err != nil {
+			return nil, fmt.Errorf("SEARCH UNSEEN failed: %w", err)
+		}
+		uids := searchData.AllUIDs()
+		if len(uids) == 0 {
+			return &ListResult{
+				Messages: []*Message{},
+				Total:    int(numMessages),
+				Unread:   0,
+				Folder:   folder,
+			}, nil
+		}
+		// Apply limit to unread UIDs (take newest)
+		limit := opts.Limit
+		if limit <= 0 {
+			limit = 20
+		}
+		// UIDs are returned in ascending order, take the last N for newest
+		startIdx := 0
+		if len(uids) > limit {
+			startIdx = len(uids) - limit
+		}
+		uidSet = imap.UIDSet{}
+		for _, uid := range uids[startIdx:] {
+			uidSet.AddNum(imap.UID(uid))
+		}
+	} else {
+		// Calculate the range of sequence numbers to fetch
+		limit := opts.Limit
+		if limit <= 0 {
+			limit = 20
+		}
+		start := uint32(1)
+		if numMessages > uint32(limit) {
+			start = numMessages - uint32(limit) + 1
+		}
+
+		// Fetch using sequence numbers, then convert to UID set
+		seqSet := imap.SeqSet{}
+		seqSet.AddRange(start, numMessages)
+
+		fetchOptions := &imap.FetchOptions{
+			Envelope: true,
+			Flags:    true,
+			UID:      true,
+		}
+
+		msgs, err := c.client.Fetch(seqSet, fetchOptions).Collect()
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch messages: %w", err)
+		}
+
+		// Build UID set from fetched messages
+		uidSet = imap.UIDSet{}
+		for _, msg := range msgs {
+			uidSet.AddNum(msg.UID)
+		}
 	}
 
-	// Fetch using sequence numbers
-	seqSet := imap.SeqSet{}
-	seqSet.AddRange(start, numMessages)
-
+	// Fetch the actual messages using UID set
 	fetchOptions := &imap.FetchOptions{
 		Envelope: true,
 		Flags:    true,
 		UID:      true,
 	}
 
-	msgs, err := c.client.Fetch(seqSet, fetchOptions).Collect()
+	msgs, err := c.client.Fetch(uidSet, fetchOptions).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch messages: %w", err)
 	}

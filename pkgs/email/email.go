@@ -84,6 +84,7 @@ type FetchOptions struct {
 	Limit      int
 	MarkAsSeen bool
 	DeleteAfterRetrieve bool // For POP3
+	UnreadOnly  bool   // Only fetch unread messages (IMAP only)
 }
 
 // Folder represents an email folder
