@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/mail"
@@ -80,14 +82,29 @@ func main() {
 		fatal("no Message-ID header found in email")
 	}
 
-	// Build output path
-	filename := sanitizeFilename(messageID) + ".eml"
+	// Generate filename: use hash to avoid leaking information from Message-ID
+	// Message-ID can contain internal domains or user info
+	// Format: <hash>.eml where hash uses message_id + random for uniqueness
+	b := make([]byte, 4)
+	var filename string
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp if crypto/rand fails
+		filename = fmt.Sprintf("%d.eml", time.Now().UnixNano())
+	} else {
+		// Use message ID + random suffix for unique hash
+		hashInput := messageID + hex.EncodeToString(b)
+		// Use first 16 chars of hex encoding (enough for uniqueness)
+		filename = sanitizeFilename(hashInput[:16]) + ".eml"
+	}
+
 	path := filepath.Join(dir, filename)
 
-	// Check if file already exists — append timestamp to avoid overwrite
+	// Check if file already exists — append random suffix to avoid overwrite
 	if _, err := os.Stat(path); err == nil {
-		timestamp := strings.ReplaceAll(time.Now().Format("20060102-150405"), ":", "")
-		filename = sanitizeFilename(messageID) + "-" + timestamp + ".eml"
+		// Hash collision or duplicate - add extra random bytes
+		extra := make([]byte, 4)
+		rand.Read(extra)
+		filename = sanitizeFilename(hex.EncodeToString(b)+hex.EncodeToString(extra)) + ".eml"
 		path = filepath.Join(dir, filename)
 	}
 
@@ -147,13 +164,14 @@ Usage:
 
 Description:
   Reads a raw RFC 5322 email from stdin and saves it as an .eml file
-  in the specified directory, using the Message-ID header as the filename.
+  in the specified directory, using a hashed filename based on Message-ID.
 
   The email is streamed from stdin with bounded memory usage — only the
   headers are buffered in memory for Message-ID extraction; the body is
   written directly to disk.
 
-  The filename is sanitized for filesystem safety.
+  The filename is hashed to avoid leaking internal information from Message-ID
+  (e.g., internal domain names or user identifiers).
 
 Examples:
   # In watch mode

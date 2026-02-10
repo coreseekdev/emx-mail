@@ -321,12 +321,21 @@ func (c *pop3Conn) send(s string) error {
 
 // cmd sends a command and reads the response.
 // If isMulti is true, it reads until the "." terminator.
+// Args can be int or string - converted efficiently without fmt.Sprintf.
 func (c *pop3Conn) cmd(cmd string, isMulti bool, args ...interface{}) (*bytes.Buffer, error) {
 	cmdLine := cmd
 	if len(args) > 0 {
 		parts := make([]string, len(args))
 		for i, a := range args {
-			parts[i] = fmt.Sprintf("%v", a)
+			switch v := a.(type) {
+			case int:
+				parts[i] = strconv.Itoa(v)
+			case string:
+				parts[i] = v
+			default:
+				// Fallback for any other type (should not happen in current code)
+				parts[i] = fmt.Sprintf("%v", v)
+			}
 		}
 		cmdLine = cmd + " " + strings.Join(parts, " ")
 	}
