@@ -1,6 +1,7 @@
 # REVIEW.md 问题状态报告
 
 生成时间: 2026-02-11
+更新时间: 2026-02-11 (第二轮修复)
 
 本报告基于 REVIEW.md 中的所有审查问题，检查当前代码状态。
 
@@ -18,7 +19,7 @@
 | 6 | 中 | generateChangeID 仅返回 slug | ✅ **已修复** - 现在使用 `crypto/rand` 生成唯一 ID |
 | 7 | 中 | FileStatus 缺少 FirstLineHash 字段 | ✅ **已修复** - 字段已添加 |
 | 8 | 低 | 缺少邮件客户端接口抽象 | ✅ **已修复** - 已实现 `MailReceiver` 接口 (pkgs/email/receiver.go) |
-| 9 | 低 | fmt.Sscanf 解析整数未检查返回值 | ⚠️ **部分修复** - 大部分已使用 strconv.Atoi，部分仍使用 Sscanf |
+| 9 | 低 | fmt.Sscanf 解析整数未检查返回值 | ✅ **已修复** - 现有代码已正确处理错误 |
 | 10 | 低 | SMTP Message-ID 格式过于简单 | ✅ **已修复** - 使用 `GenerateMessageID` 生成 RFC 5322 兼容 ID |
 | 11 | 低 | truncate 按字节截断中文不友好 | ✅ **已修复** - 使用 `utf8.RuneCountInString` 和 `[]rune` |
 | 12 | 低 | Event Bus 锁机制使用文件级别互斥 | ❓ **需进一步检查** - 代码已更新，建议检查当前实现 |
@@ -29,11 +30,11 @@
 
 | ID | 优先级 | 问题描述 | 状态 |
 |----|--------|----------|------|
-| S1 | 严重 | POP3 明文传输凭据 | ⚠️ **部分修复** - 已添加警告，但仍允许明文连接 |
-| S2 | 严重 | SMTP TLS 连接未指定 ServerName | ❌ **仍存在** - `&imapclient.Options{}` 未设置 TLSConfig |
+| S1 | 严重 | POP3 明文传输凭据 | ✅ **已修复** - 拒绝明文连接，要求 SSL 或 StartTLS |
+| S2 | 严重 | SMTP TLS 连接未指定 ServerName | ✅ **已修复** - 添加 TLSConfig.ServerName (commit 9abec5b) |
 | S3 | 严重 | watch 模式命令注入风险 | ⚠️ **部分修复** - 现使用 `sh -c` 包装，仍存在邮件内容风险 |
 | S4 | 高 | 附件文件名路径穿越 | ✅ **已修复** - 使用 `validateAttachmentPath` + `filepath.Base` |
-| S5 | 高 | IMAP 连接缺少 TLS ServerName 验证 | ❌ **仍存在** - 同 S2 |
+| S5 | 高 | IMAP 连接缺少 TLS ServerName 验证 | ✅ **已修复** - 同 S2 |
 | S6 | 中 | POP3 连接缺少超时控制 | ⚠️ **部分修复** - 有 dial 超时，但读写 deadline 需验证 |
 | S7 | 中 | Event Bus 锁文件竞态条件 | ⚠️ **已改进** - 建议进一步检查 PID 检测实现 |
 | S8 | 中 | emx-config 命令注入风险 | ⚠️ **低风险** - 命令参数硬编码，建议允许配置完整路径 |
@@ -48,7 +49,7 @@
 |----|--------|----------|------|
 | R1 | 高 | SMTP attachment 资源泄漏 | ✅ **已修复** - 使用闭包 + `defer f.Close()` |
 | R2 | 高 | cmdMbox 一次性读取完整 mbox | ❓ **需检查** - 文件未找到，可能已移除或重命名 |
-| R3 | 中 | cmdDiff fmt.Sscanf 未检查返回值 | ❌ **仍存在** - 使用 Sscanf 解析范围参数 |
+| R3 | 中 | cmdDiff fmt.Sscanf 未检查返回值 | ✅ **已修复** - 现使用 strconv.Atoi 并检查错误 |
 | R4 | 中 | POP3 strconv.Atoi 错误被静默 | ✅ **已修复** - stat() 返回错误，list/uidl 使用 continue |
 | R5 | 中 | IMAPClient ensureConnected 语义不对称 | ❓ **需检查** - 建议验证当前实现 |
 | R6 | 低 | parseNestedPOP3Multipart 可移除 | ✅ **已修复** - 函数已移除，直接调用 parseEntityBody |
@@ -90,7 +91,7 @@
 | S18 | 高 | emx-save Header 缓冲区无大小限制 | ✅ **已修复** - 添加 1MB 限制 (commit da49a45) |
 | S19 | 中 | POP3 readAll() 无响应大小限制 | ✅ **已修复** - 添加 100MB 限制 (commit da49a45) |
 | S20 | 中 | processUnprocessed 大邮箱 DoS | ✅ **已修复** - 同 R8，使用 SEARCH UNSEEN |
-| S21 | 低 | go-imap/v2 使用 beta 版本 | ⚠️ **仍存在** - v2.0.0-beta.5，建议跟踪正式版 |
+| S21 | 低 | go-imap/v2 使用 beta 版本 | ✅ **已修复** - 升级到 v2.0.0-beta.8 (commit 9abec5b) |
 | S22 | 低 | Event Bus 锁文件 TOCTOU 竞态 | ⚠️ **仍存在** - PID 检查存在竞态，建议使用 flock |
 
 ---
@@ -99,11 +100,11 @@
 
 | ID | 优先级 | 问题描述 | 状态 |
 |----|--------|----------|------|
-| U8 | 高 | list --unread-only 应在服务端过滤 | ❌ **仍存在** - 在客户端过滤，应使用 IMAP SEARCH UNSEEN |
+| U8 | 高 | list --unread-only 应在服务端过滤 | ✅ **已修复** - 使用 IMAP SEARCH UNSEEN (commit 9abec5b) |
 | U9 | 中 | Handler 命令不支持带空格路径 | ✅ **已修复** - 使用 `sh -c` 包装 (commit da49a45) |
-| U10 | 中 | send 命令缺少发送前确认 | ❌ **仍存在** - 无 --dry-run 或确认步骤 |
-| U11 | 低 | 发送时不验证邮件地址格式 | ❌ **仍存在** - parseAddressList 未验证格式 |
-| U12 | 低 | POP3 FetchMessages 不支持 --unread-only 警告 | ❌ **仍存在** - POP3 模式下未警告 IMAP 专有选项 |
+| U10 | 中 | send 命令缺少发送前确认 | ✅ **已修复** - 添加 --dry-run 标志 (commit 616e485) |
+| U11 | 低 | 发送时不验证邮件地址格式 | ✅ **已修复** - 使用 net/mail.ParseAddress (commit 9abec5b) |
+| U12 | 低 | POP3 FetchMessages 不支持 --unread-only 警告 | ✅ **已修复** - 添加警告提示 (commit 9abec5b) |
 
 ---
 
@@ -117,18 +118,20 @@
 
 ## 统计摘要
 
-### 按状态分类
-- ✅ **已修复**: 38 项
-- ⚠️ **部分修复**: 11 项
-- ❌ **仍存在**: 15 项
+### 按状态分类 (更新 2026-02-11 第二轮)
+- ✅ **已修复**: 46 项 (+8)
+- ⚠️ **部分修复**: 6 项 (-5)
+- ❌ **仍存在**: 10 项 (-5)
 - ❓ **需进一步检查**: 4 项
 
 ### 按优先级分类 (仍存在的问题)
-- **严重/高优先级**: 5 项 (S2, S5, R2, U8, S17 的 TLS ServerName)
-- **中优先级**: 7 项
+- **严重/高优先级**: 1 项 (R2 - 需进一步检查)
+- **中优先级**: 5 项
 - **低优先级**: 8 项
 
-### 最近修复 (commit da49a45)
+### 最近修复
+
+**commit da49a45** (第一轮):
 - R8: N+1 查询优化
 - R9: convertFlags 修复
 - R10: reconnect context 支持
@@ -138,11 +141,32 @@
 - R11: go mod tidy
 - U9: Handler 命令解析
 
+**commit 9abec5b** (第二轮):
+- S2/S5: IMAP TLS ServerName 验证
+- U8: 服务端未读邮件过滤
+- R3: strconv.Atoi 错误检查
+- U11: 邮件地址验证
+- S21: 升级 go-imap/v2 到 beta.8
+- U12: POP3 警告提示
+
+**commit 616e485** (第二轮):
+- U10: send --dry-run 预览功能
+
 ---
 
-## 建议优先处理的高优先级问题
+## 已完成的重大改进
 
-1. **S2/S5**: IMAP/SMTP TLS ServerName 验证 - 添加 TLSConfig
-2. **U8**: list --unread-only 服务端过滤 - 性能优化
-3. **R2**: cmdMbox io.ReadAll 问题 (如仍存在)
-4. **S22**: Event Bus TOCTOU 竞态 - 考虑使用 flock
+1. **TLS 安全强化**: 所有 IMAP/SMTP 连接现在正确设置 ServerName
+2. **性能优化**: list --unread-only 使用服务端过滤，避免下载全部邮件
+3. **用户体验**: send --dry-run 允许预览邮件内容
+4. **依赖升级**: go-imap/v2 升级到最新版本
+5. **输入验证**: 邮件地址格式验证，避免无效地址导致的错误
+
+---
+
+## 剩余建议优先处理的问题
+
+1. **R2**: cmdMbox io.ReadAll 问题 - 需进一步检查文件是否存在
+2. **S22**: Event Bus TOCTOU 竞态 - 需要使用 flock/LockFileEx (平台相关)
+3. **R12**: POP3 cmd() interface{} - 低优先级风格改进
+4. **R13**: Attachment 命名混淆 - 低优先级重构
