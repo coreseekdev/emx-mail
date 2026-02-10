@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,9 +17,8 @@ const version = "1.0.0"
 
 // app holds global options parsed from the command line
 type app struct {
-	configPath string
-	account    string
-	verbose    bool
+	account string
+	verbose bool
 }
 
 func main() {
@@ -28,12 +28,6 @@ func main() {
 	// Parse global flags (before the subcommand)
 	for len(args) > 0 {
 		switch args[0] {
-		case "-config":
-			if len(args) < 2 {
-				fatal("-config requires a value")
-			}
-			a.configPath = args[1]
-			args = args[2:]
 		case "-account":
 			if len(args) < 2 {
 				fatal("-account requires a value")
@@ -66,8 +60,7 @@ dispatch:
 
 	// "init" doesn't need config loaded
 	if cmd == "init" {
-		cfgPath := a.resolveConfigPath()
-		if err := handleInit(cfgPath); err != nil {
+		if err := handleInit(); err != nil {
 			fatal("init: %v", err)
 		}
 		return
@@ -111,23 +104,11 @@ func fatal(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func (a *app) resolveConfigPath() string {
-	if a.configPath != "" {
-		return a.configPath
-	}
-	p, err := config.GetDefaultConfigPath()
-	if err != nil {
-		fatal("failed to get config path: %v", err)
-	}
-	return p
-}
-
 func (a *app) loadAccount() *config.AccountConfig {
-	cfgPath := a.resolveConfigPath()
-	cfg, err := config.LoadConfig(cfgPath)
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to load config from %s: %v\n", cfgPath, err)
-		fmt.Fprintf(os.Stderr, "Run 'emx-mail init' to create a config file\n")
+		fmt.Fprintf(os.Stderr, "Error: failed to load config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Run 'emx-mail init' to create config instructions\n")
 		os.Exit(1)
 	}
 	acc, err := cfg.GetAccount(a.account)
@@ -596,12 +577,32 @@ func handleFolders(acc *config.AccountConfig) error {
 	return nil
 }
 
-func handleInit(configPath string) error {
-	cfg := config.ExampleConfig()
-	if err := config.SaveConfig(configPath, cfg); err != nil {
+func handleInit() error {
+	root := config.ExampleRootConfig()
+
+	if config.HasEmxConfig() {
+		data, err := json.MarshalIndent(root, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format example config: %w", err)
+		}
+
+		fmt.Println("emx-config detected. Configure emx-mail using emx-config.")
+		fmt.Println("Example JSON (keys under 'mail'):")
+		fmt.Println(string(data))
+		fmt.Println("Store this in your emx-config file (e.g., config.json).")
+		fmt.Println("Then verify with: emx-config list --json")
+		return nil
+	}
+
+	configPath, err := config.GetEnvConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := config.SaveConfig(configPath, root); err != nil {
 		return err
 	}
 	fmt.Printf("Created config file at: %s\n", configPath)
+	fmt.Printf("Set %s to point to this file.\n", config.EnvConfigJSONPath)
 	fmt.Println("Please edit the file to add your email account credentials.")
 	return nil
 }
@@ -660,10 +661,13 @@ Commands:
   init       Initialize configuration file
 
 Global Options:
-  -config <path>   Path to config file (default: ~/.emx-mail/config.json)
   -account <name>  Account name or email to use
   -v               Verbose output
   -version         Show version information
+
+Config Resolution:
+  1) If emx-config exists: emx-mail reads config via emx-config list --json.
+  2) Otherwise: set env var EMX_MAIL_CONFIG_JSON to a JSON config file.
 
 Send Options:
   -to <emails>         Recipients (comma-separated)

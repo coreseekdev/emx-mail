@@ -1,13 +1,26 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
+)
+
+const (
+	// EnvConfigJSONPath is the env var that points to the JSON config file
+	// used when emx-config is not available.
+	EnvConfigJSONPath = "EMX_MAIL_CONFIG_JSON"
 )
 
 // AccountConfig holds email account configuration
+//
+// NOTE: This structure mirrors the emx-config nested config schema.
+// See ExampleRootConfig for the expected JSON shape.
 type AccountConfig struct {
 	Name     string `json:"name"`
 	Email    string `json:"email"`
@@ -50,35 +63,53 @@ type AccountConfig struct {
 }
 
 // Config holds the application configuration
+//
+// accounts is a map keyed by account name.
+// default_account selects the account when none is specified.
 type Config struct {
-	Accounts     []AccountConfig `json:"accounts"`
-	DefaultAccount string        `json:"default_account,omitempty"`
+	Accounts       map[string]AccountConfig `json:"accounts"`
+	DefaultAccount string                   `json:"default_account,omitempty"`
 }
 
-// LoadConfig loads configuration from a file
-func LoadConfig(path string) (*Config, error) {
+// RootConfig wraps the app config to align with emx-config list --json output.
+type RootConfig struct {
+	Mail Config `json:"mail"`
+}
+
+// HasEmxConfig returns true when the emx-config CLI is available in PATH.
+func HasEmxConfig() bool {
+	_, err := exec.LookPath("emx-config")
+	return err == nil
+}
+
+// LoadConfig loads configuration based on the new emx-config-first mechanism.
+//
+// 1) If emx-config exists: read config from `emx-config list --json`.
+// 2) Otherwise: read config from the JSON file specified by EnvConfigJSONPath.
+func LoadConfig() (*Config, error) {
+	if HasEmxConfig() {
+		return loadFromEmxConfig()
+	}
+	return loadFromEnvJSON()
+}
+
+// LoadConfigFile loads configuration from a JSON file path.
+func LoadConfigFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
-	}
-
-	return &cfg, nil
+	return parseRootConfig(data)
 }
 
-// SaveConfig saves configuration to a file
-func SaveConfig(path string, cfg *Config) error {
-	// Create directory if it doesn't exist
+// SaveConfig saves configuration to a JSON file path.
+func SaveConfig(path string, root *RootConfig) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
@@ -90,50 +121,62 @@ func SaveConfig(path string, cfg *Config) error {
 	return nil
 }
 
-// GetDefaultConfigPath returns the default configuration file path
-func GetDefaultConfigPath() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("failed to get home directory: %w", err)
+// GetEnvConfigPath returns the config file path from EnvConfigJSONPath.
+func GetEnvConfigPath() (string, error) {
+	path := strings.TrimSpace(os.Getenv(EnvConfigJSONPath))
+	if path == "" {
+		return "", fmt.Errorf("%s is not set", EnvConfigJSONPath)
 	}
-
-	return filepath.Join(homeDir, ".emx-mail", "config.json"), nil
+	return path, nil
 }
 
-// GetAccount returns an account by name or email
+// GetAccount returns an account by name or email.
 func (c *Config) GetAccount(identifier string) (*AccountConfig, error) {
-	// If identifier is empty, use default account
+	if c.Accounts == nil || len(c.Accounts) == 0 {
+		return nil, fmt.Errorf("no accounts configured")
+	}
+
 	if identifier == "" {
 		if c.DefaultAccount != "" {
 			identifier = c.DefaultAccount
-		} else if len(c.Accounts) > 0 {
-			// Use first account as default
-			return &c.Accounts[0], nil
 		} else {
-			return nil, fmt.Errorf("no accounts configured")
+			// Deterministic fallback to the first key
+			keys := make([]string, 0, len(c.Accounts))
+			for k := range c.Accounts {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			identifier = keys[0]
 		}
 	}
 
-	// Search by name or email
-	for i := range c.Accounts {
-		acc := &c.Accounts[i]
+	// Direct name match (map key)
+	if acc, ok := c.Accounts[identifier]; ok {
+		return &acc, nil
+	}
+
+	// Search by name or email fields
+	for name, acc := range c.Accounts {
 		if acc.Name == identifier || acc.Email == identifier {
-			return acc, nil
+			if acc.Name == "" {
+				acc.Name = name
+			}
+			return &acc, nil
 		}
 	}
 
 	return nil, fmt.Errorf("account not found: %s", identifier)
 }
 
-// Validate validates the configuration
+// Validate validates the configuration.
 func (c *Config) Validate() error {
-	if len(c.Accounts) == 0 {
+	if c.Accounts == nil || len(c.Accounts) == 0 {
 		return fmt.Errorf("no accounts configured")
 	}
 
-	for i, acc := range c.Accounts {
+	for name, acc := range c.Accounts {
 		if acc.Name == "" {
-			return fmt.Errorf("account %d: name is required", i)
+			acc.Name = name
 		}
 		if acc.Email == "" {
 			return fmt.Errorf("account %s: email is required", acc.Name)
@@ -145,44 +188,112 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.DefaultAccount != "" {
+		if _, ok := c.Accounts[c.DefaultAccount]; !ok {
+			return fmt.Errorf("default_account not found: %s", c.DefaultAccount)
+		}
+	}
+
 	return nil
 }
 
-// ExampleConfig returns an example configuration for "init"
-func ExampleConfig() *Config {
-	return &Config{
-		Accounts: []AccountConfig{
-			{
-				Name:     "Example Account",
-				Email:    "user@example.com",
-				FromName: "Your Name",
-				IMAP: struct {
-					Host     string `json:"host"`
-					Port     int    `json:"port"`
-					Username string `json:"username"`
-					Password string `json:"password,omitempty"`
-					SSL      bool   `json:"ssl"`
-					StartTLS bool   `json:"starttls"`
-				}{
-					Host:     "imap.example.com",
-					Port:     993,
-					Username: "user@example.com",
-					SSL:      true,
-				},
-				SMTP: struct {
-					Host     string `json:"host"`
-					Port     int    `json:"port"`
-					Username string `json:"username"`
-					Password string `json:"password,omitempty"`
-					SSL      bool   `json:"ssl"`
-					StartTLS bool   `json:"starttls"`
-				}{
-					Host:     "smtp.example.com",
-					Port:     587,
-					Username: "user@example.com",
-					StartTLS: true,
+// ExampleRootConfig returns an example configuration for "init".
+func ExampleRootConfig() *RootConfig {
+	return &RootConfig{
+		Mail: Config{
+			DefaultAccount: "work",
+			Accounts: map[string]AccountConfig{
+				"work": {
+					Name:     "Work Account",
+					Email:    "user@example.com",
+					FromName: "Your Name",
+					IMAP: struct {
+						Host     string `json:"host"`
+						Port     int    `json:"port"`
+						Username string `json:"username"`
+						Password string `json:"password,omitempty"`
+						SSL      bool   `json:"ssl"`
+						StartTLS bool   `json:"starttls"`
+					}{
+						Host:     "imap.example.com",
+						Port:     993,
+						Username: "user@example.com",
+						SSL:      true,
+					},
+					SMTP: struct {
+						Host     string `json:"host"`
+						Port     int    `json:"port"`
+						Username string `json:"username"`
+						Password string `json:"password,omitempty"`
+						SSL      bool   `json:"ssl"`
+						StartTLS bool   `json:"starttls"`
+					}{
+						Host:     "smtp.example.com",
+						Port:     587,
+						Username: "user@example.com",
+						StartTLS: true,
+					},
+					POP3: struct {
+						Host     string `json:"host"`
+						Port     int    `json:"port"`
+						Username string `json:"username"`
+						Password string `json:"password,omitempty"`
+						SSL      bool   `json:"ssl"`
+						StartTLS bool   `json:"starttls"`
+					}{
+						Host:     "pop3.example.com",
+						Port:     995,
+						Username: "user@example.com",
+						SSL:      true,
+					},
 				},
 			},
 		},
 	}
+}
+
+// --- internal helpers ---
+
+func loadFromEnvJSON() (*Config, error) {
+	path, err := GetEnvConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	return LoadConfigFile(path)
+}
+
+func loadFromEmxConfig() (*Config, error) {
+	cmd := exec.Command("emx-config", "list", "--json")
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+
+	if err := cmd.Run(); err != nil {
+		stderr := strings.TrimSpace(errOut.String())
+		if stderr != "" {
+			return nil, fmt.Errorf("emx-config list --json failed: %w: %s", err, stderr)
+		}
+		return nil, fmt.Errorf("emx-config list --json failed: %w", err)
+	}
+
+	return parseRootConfig(out.Bytes())
+}
+
+func parseRootConfig(data []byte) (*Config, error) {
+	var root RootConfig
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	cfg := &root.Mail
+	if cfg.Accounts == nil {
+		return nil, fmt.Errorf("missing required key: mail.accounts")
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
 }

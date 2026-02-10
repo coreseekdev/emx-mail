@@ -105,6 +105,10 @@ go build -o emx-b4.exe ./cmd/b4
 ./emx-mail.exe fetch -uid 8 -save-attachments ./downloads/
 ```
 
+配置读取优先级：
+1. 如果系统存在 `emx-config`，则通过 `emx-config list --json` 读取配置。
+2. 否则从环境变量 `EMX_MAIL_CONFIG_JSON` 指定的 JSON 文件读取。
+
 ### 补丁管理使用
 
 ```bash

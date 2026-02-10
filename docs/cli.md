@@ -13,10 +13,14 @@ go build -o emx-mail ./cmd/cli/
 
 | 选项 | 说明 |
 |------|------|
-| `-config <路径>` | 配置文件路径（默认 `~/.emx-mail/config.json`） |
 | `-account <名称>` | 使用指定账户（按名称或邮箱匹配） |
 | `-v` | 详细输出 |
 | `-version` | 显示版本 |
+
+## 配置读取优先级
+
+1. 如果系统存在 `emx-config`，则通过 `emx-config list --json` 读取配置。
+2. 如果不存在 `emx-config`，则从环境变量 `EMX_MAIL_CONFIG_JSON` 指定的 JSON 文件读取。
 
 ## 命令一览
 
@@ -28,27 +32,36 @@ emx-mail [全局选项] <命令> [命令选项]
 
 ### init — 初始化配置
 
-生成示例配置文件，编辑后填入邮箱凭据即可使用。
+生成新版格式的示例配置。
 
 ```bash
 emx-mail init
-# 输出: Created config file at: ~/.emx-mail/config.json
 ```
 
-配置文件结构（JSON）：
+当系统存在 `emx-config` 时，`init` 会输出示例 JSON（用于写入 emx-config 的配置文件）。
+当系统不存在 `emx-config` 时，请先设置环境变量：
+
+```bash
+set EMX_MAIL_CONFIG_JSON= C:\path\to\emx-mail.json
+```
+
+配置文件结构（JSON，包含 `mail` 根节点）：
 
 ```json
 {
-  "accounts": [
-    {
-      "name": "工作邮箱",
-      "email": "user@example.com",
-      "from_name": "张三",
-      "imap": { "host": "imap.example.com", "port": 993, "username": "user", "password": "pass", "ssl": true },
-      "smtp": { "host": "smtp.example.com", "port": 587, "username": "user", "password": "pass", "starttls": true },
-      "pop3": { "host": "pop3.example.com", "port": 995, "username": "user", "password": "pass", "ssl": true }
+  "mail": {
+    "default_account": "work",
+    "accounts": {
+      "work": {
+        "name": "工作邮箱",
+        "email": "user@example.com",
+        "from_name": "张三",
+        "imap": { "host": "imap.example.com", "port": 993, "username": "user", "password": "pass", "ssl": true },
+        "smtp": { "host": "smtp.example.com", "port": 587, "username": "user", "password": "pass", "starttls": true },
+        "pop3": { "host": "pop3.example.com", "port": 995, "username": "user", "password": "pass", "ssl": true }
+      }
     }
-  ]
+  }
 }
 ```
 
