@@ -501,18 +501,14 @@ func (c *IMAPClient) watchIDLE(ctx context.Context, opts WatchOptions, statusWri
 		if err != nil {
 			return fmt.Errorf("IDLE start failed: %w", err)
 		}
-		if err := idleCmd.Wait(); err != nil {
-			return fmt.Errorf("IDLE wait failed: %w", err)
-		}
 
 		// Wait for updates or timeout.
 		// The goroutine waits for server-side IDLE events;
 		// buffered channel ensures it can exit even if we time out first,
 		// and idleCmd.Close() ensures Wait() returns promptly.
-		done := make(chan struct{}, 1)
+		done := make(chan error, 1)
 		go func() {
-			idleCmd.Wait()
-			done <- struct{}{}
+			done <- idleCmd.Wait()
 		}()
 
 		timer := time.NewTimer(idleTimeout)
@@ -520,7 +516,7 @@ func (c *IMAPClient) watchIDLE(ctx context.Context, opts WatchOptions, statusWri
 		case <-ctx.Done():
 			timer.Stop()
 			idleCmd.Close()
-			<-done
+			<-done // drain the channel
 			statusWrite(WatchStatus{
 				Type:    "connection",
 				Level:   "info",
@@ -538,10 +534,22 @@ func (c *IMAPClient) watchIDLE(ctx context.Context, opts WatchOptions, statusWri
 				Message: "IDLE timeout, sending NOOP to keep connection alive",
 			})
 
-		case <-done:
-			// Server sent new email data
+		case err := <-done:
+			// Server sent new email data or IDLE failed
 			timer.Stop()
 			idleCmd.Close()
+			if err != nil {
+				statusWrite(WatchStatus{
+					Type:    "error",
+					Level:   "error",
+					Message: fmt.Sprintf("IDLE failed: %v", err),
+				})
+				// Try to reconnect
+				if err := c.reconnect(ctx, opts, statusWrite); err != nil {
+					return err
+				}
+				continue
+			}
 			statusWrite(WatchStatus{
 				Type:    "idle",
 				Level:   "info",
